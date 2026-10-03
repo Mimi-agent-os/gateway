@@ -1,0 +1,43 @@
+# Dependencies and build output
+node_modules/
+dist/
+.pnpm-store/
+*.tgz
+*.tsbuildinfo
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.key
+*.pem
+.local-token
+
+# Runtime state and test output
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.log
+*.pid
+coverage/
+.nyc_output/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Default gateway home: keys, provider credentials and databases
+/mimi/
+
+# Agent and devkit state
+/data/
+.mimi-dev/

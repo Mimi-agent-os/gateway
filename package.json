@@ -1,0 +1,49 @@
+{
+    "name": "mimi-gateway",
+    "version": "0.1.0",
+    "private": true,
+    "description": "mimi-os gateway daemon: models, LLM turns, and the link between agents",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/Mimi-agent-os/gateway.git"
+    },
+    "homepage": "https://github.com/Mimi-agent-os/gateway",
+    "bugs": "https://github.com/Mimi-agent-os/gateway/issues",
+    "type": "module",
+    "license": "Apache-2.0",
+    "engines": {
+        "node": ">=24"
+    },
+    "bin": {
+        "mimi": "./dist/cli/mimi.js"
+    },
+    "exports": {
+        "./cli": "./dist/cli/mimi.js",
+        "./device-client": {
+            "types": "./dist/device-client.d.ts",
+            "default": "./dist/device-client.js"
+        }
+    },
+    "files": [
+        "dist"
+    ],
+    "scripts": {
+        "build": "pnpm run clean && tsc -p tsconfig.build.json",
+        "check": "tsc",
+        "test": "node --test \"test/**/*.test.ts\"",
+        "clean": "node -e \"fs.rmSync('dist', { recursive: true, force: true })\"",
+        "start": "node --disable-warning=ExperimentalWarning dist/daemon.js"
+    },
+    "dependencies": {
+        "@dotenvx/dotenvx": "1.75.1",
+        "@mimi-os/protocol": "link:../protocol",
+        "ws": "8.21.3"
+    },
+    "devDependencies": {
+        "@mimi-os/sdk": "link:../sdk",
+        "@types/node": "^25.6.2",
+        "@types/ws": "8.18.1",
+        "typescript": "6.0.3"
+    },
+    "packageManager": "pnpm@10.34.5"
+}
