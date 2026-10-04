@@ -22,6 +22,7 @@ import type { DescribeDrop, IncomingRequest, RequestOptions } from "./registry-t
  *  one: a stream-0 message wrapper over an agent-role ServerSession. */
 export interface AgentSocket {
     readonly open: boolean;
+    /** Throws on a message the channel cannot carry, and only the request behind it fails. */
     send(text: string): void;
     close(code?: number, reason?: string): void;
     /** The next gateway-initiated stream on this session, or null when the socket is closing or
@@ -49,7 +50,7 @@ interface Pending {
     replyType: string;
     resolve: (v: unknown) => void;
     reject: (e: unknown) => void;
-    timer: ReturnType<typeof setTimeout>;
+    timer: ReturnType<typeof setTimeout> | undefined;
     cleanup(): void;
 }
 
@@ -74,6 +75,7 @@ export class AgentPeer {
 
     private readonly log: (msg: string) => void;
     private readonly deadlineGraceMs: number;
+    private readonly defaultTimeoutMs: number;
     private readonly pending = new Map<string, Pending>();
     /** Epoch ms each deadlined request told the agent to finish by, kept until that moment even if
      *  the waiter here is gone: a turn Stop frees the gateway, the agent's own expire timer ends it. */
@@ -85,12 +87,14 @@ export class AgentPeer {
         log: (msg: string) => void,
         from: string | null = null,
         deadlineGraceMs = DEADLINE_GRACE_MS,
+        defaultTimeoutMs = DEFAULT_TIMEOUT_MS,
     ) {
         this.socket = socket;
         this.pinName = pinName;
         this.log = log;
         this.from = from;
         this.deadlineGraceMs = deadlineGraceMs;
+        this.defaultTimeoutMs = defaultTimeoutMs;
         socket.onmessage = (text): void => this.receive(text);
         socket.onclose = (): void => {
             this.teardown(new PeerError(`agent "${this.name || "?"}" disconnected`, "error"));
@@ -129,9 +133,13 @@ export class AgentPeer {
             for (const [key, at] of this.deadlines) if (at <= now) this.deadlines.delete(key);
             this.deadlines.set(id, now + opts.deadline);
         }
+        // `??` would read an explicit null (no timer) as unset
         const timeoutMs =
-            opts?.timeoutMs ??
-            (opts?.deadline !== undefined ? opts.deadline + this.deadlineGraceMs : DEFAULT_TIMEOUT_MS);
+            opts?.timeoutMs !== undefined
+                ? opts.timeoutMs
+                : opts?.deadline !== undefined
+                  ? opts.deadline + this.deadlineGraceMs
+                  : this.defaultTimeoutMs;
         return new Promise<OkPayloadOf<K>>((resolve, reject) => {
             const signal = opts?.signal;
             const abort = (): void => {
@@ -145,11 +153,15 @@ export class AgentPeer {
                 replyType: REPLY_OF[type],
                 resolve: (v) => resolve(v as OkPayloadOf<K>),
                 reject,
-                timer: setTimeout(() => {
-                    this.pending.delete(id);
-                    signal?.removeEventListener("abort", abort);
-                    reject(new PeerError(`${type}: no reply within ${timeoutMs}ms`, "timeout"));
-                }, timeoutMs),
+                // teardown() still rejects a timerless request when the socket closes
+                timer:
+                    timeoutMs === null
+                        ? undefined
+                        : setTimeout(() => {
+                              this.pending.delete(id);
+                              signal?.removeEventListener("abort", abort);
+                              reject(new PeerError(`${type}: no reply within ${timeoutMs}ms`, "timeout"));
+                          }, timeoutMs),
                 cleanup: () => {
                     clearTimeout(entry.timer);
                     signal?.removeEventListener("abort", abort);

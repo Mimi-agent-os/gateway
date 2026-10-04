@@ -38,6 +38,8 @@ export interface RegistryOptions {
     healthIntervalMs?: number | undefined;
     /** How long past a request's deadline the gateway still waits for the agent's reply. */
     deadlineGraceMs?: number | undefined;
+    /** How long a request with neither a deadline nor a timeout of its own waits for the reply. */
+    defaultTimeoutMs?: number | undefined;
     grants?: (agent: string) => ModelGrant[];
 }
 
@@ -310,7 +312,8 @@ export class Registry {
      *  passed. `pinName` is the agent name the /channel handshake's lookup already bound this
      *  key to — hello must repeat it exactly. */
     accept(socket: AgentSocket, pinName: string, from: string | null = null): AgentPeer {
-        const peer = new AgentPeer(socket, pinName, this.log, from, this.opts.deadlineGraceMs);
+        const { deadlineGraceMs, defaultTimeoutMs } = this.opts;
+        const peer = new AgentPeer(socket, pinName, this.log, from, deadlineGraceMs, defaultTimeoutMs);
         peer.onRequest = (frame, p) => this.serve(frame, p);
         peer.onClosed = (p) => this.forget(p);
         // hello is one small frame; describe can near 1 MiB on a thin uplink, so it keeps the longer wait

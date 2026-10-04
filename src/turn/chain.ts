@@ -1,22 +1,14 @@
-/** The chain tool's engine: step-result reference substitution, shared with the loop's cap(). */
+/** The chain tool's engine: step-result reference substitution. */
 
 export const CHAIN_MAX_STEPS = 6;
-export const CHAIN_STEP_TEXT_MAX = 1_200;
 
-/** What every capped blob ends with — the app strips exactly this before pretty-printing. */
+/** What every capped record (an inbox body, an interaction row) ends with — the app strips exactly
+ *  this before pretty-printing. A tool result is never capped. */
 export const TRUNCATION_MARKER = "\n…[truncated]";
 
 /** `${2.items[0].id}` → ["2", "items", "0", "id"] — only digits, names, dots and [i]. */
 const CHAIN_REF = /^\$\{(\d+)((?:\.[A-Za-z_][A-Za-z0-9_]*|\[\d+\])*)\}$/;
 const CHAIN_REF_EMBEDDED = new RegExp(CHAIN_REF.source.slice(1, -1), "g");
-
-export const cap = (text: string, max: number): string => {
-    if (text.length <= max) return text;
-    if (max <= TRUNCATION_MARKER.length) return TRUNCATION_MARKER.slice(0, Math.max(0, max));
-    const prefix = text.slice(0, max - TRUNCATION_MARKER.length);
-    // A lone high surrogate would turn into U+FFFD at the next UTF-8 boundary.
-    return `${/[\uD800-\uDBFF]$/.test(prefix) ? prefix.slice(0, -1) : prefix}${TRUNCATION_MARKER}`;
-};
 
 function pick(root: unknown, path: string): unknown {
     let cur = root;

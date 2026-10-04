@@ -54,6 +54,8 @@ export interface GatewayCoreOptions {
     changedWindowMs?: number | undefined;
     /** Tests only: how long past a request's deadline the gateway still waits for the agent. */
     deadlineGraceMs?: number | undefined;
+    /** Tests only: how long a request with neither a deadline nor a timeout of its own waits (30 s). */
+    defaultTimeoutMs?: number | undefined;
     /** Tests only: how long an ask_owner question waits for the owner. */
     questionTimeoutMs?: number | undefined;
     /** Tests only: the launch-session lifetime, and the bridge's reply deadlines. */
@@ -138,7 +140,14 @@ export function createGatewayCore(opts: GatewayCoreOptions = {}): GatewayCore {
         // keyed by the gate id the device decided against, so a stale card can be retired everywhere
         onResolve: (g) => events.emit({ type: "approval_resolved", gate: g.gate, outcome: g.outcome }),
     });
-    const registry = new Registry({ db, log, events, healthIntervalMs: opts.healthIntervalMs, deadlineGraceMs: opts.deadlineGraceMs });
+    const registry = new Registry({
+        db,
+        log,
+        events,
+        healthIntervalMs: opts.healthIntervalMs,
+        deadlineGraceMs: opts.deadlineGraceMs,
+        defaultTimeoutMs: opts.defaultTimeoutMs,
+    });
     setUsageRecordedHook(db, (agent) => events.emit({ type: "usage_changed", agent }));
     const sessions = new SessionCache({ registry, log, maxBytes: opts.cache?.maxBytes, ttlMs: opts.cache?.ttlMs });
     const appTickets = new AppTickets({ events, ttlMs: opts.apps?.ttlMs });

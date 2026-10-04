@@ -90,8 +90,9 @@ const MAX_STREAM_QUEUED = 256 * 1024;
 const EPOCH_EVERY_MS = 60_000;
 const APPROVE_MODE_KEY = "device_approve_mode";
 const OP_KINDS = new Set(["devices.list", "devices.approve", "devices.reject", "devices.revoke"]);
-/** One or more DATA frames per stream-0 message, the assembled ceiling. */
-const MAX_STREAM0_BYTES = 1_048_576;
+/** One or more DATA frames per stream-0 message, the assembled ceiling — the SDK's channel holds
+ *  the same line, and closes the whole session on a message over it. */
+export const MAX_STREAM0_BYTES = 1_048_576;
 /** Every frame of a message costs at least this much of that ceiling, so a trickle of empty frames
  *  cannot grow the reassembly for free. */
 const STREAM0_FRAME_COST = 64;
@@ -800,7 +801,17 @@ export class DeviceService {
             get open(): boolean {
                 return conn.sock.open && conn.ready;
             },
-            send: (text) => this.#message(conn, text),
+            send: (text) => {
+                // the agent would drop the whole session on it, and every request in flight there:
+                // refused here, only the request that carries it fails
+                const bytes = Buffer.byteLength(text, "utf8");
+                if (bytes > MAX_STREAM0_BYTES) {
+                    throw new Error(
+                        `a message of ${bytes} bytes is over the ${MAX_STREAM0_BYTES} one channel message carries`,
+                    );
+                }
+                this.#message(conn, text);
+            },
             close: (code, reason) => conn.sock.close(code, reason),
             openAppStream: (onFrame) => {
                 if (!conn.sock.open || conn.streams.size >= MAX_APP_STREAMS) return null;

@@ -95,6 +95,196 @@ test("a silent tool times out, the error result is synthesized AND appended", as
     }
 });
 
+test("a 100 KB tool result reaches history, the tool_result event and the next model call whole", async () => {
+    const env = await boot();
+    try {
+        // multi-byte, astral and newline-heavy: a cut or a re-encoding anywhere would show
+        const big = Array.from({ length: 4_000 }, (_, i) => `row ${i}: ${"é".repeat(16)} 😀\n`).join("");
+        assert.ok(big.length > 100_000);
+        const h = await connected(env, { name: "toto", tools: READ_TOOLS, handlers: { look: { text: big } } });
+        const sid = h.createSession();
+        env.model.nextTurn(callTurn([{ id: "c1", name: "look" }]));
+        env.model.nextTurn(textTurn("read it all"));
+
+        const events: Array<Record<string, unknown>> = [];
+        const out = await env.core.runTurn({
+            agent: "toto",
+            session: sid,
+            text: "go",
+            title: false,
+            emit: (ev) => void events.push(ev),
+        });
+        assert.equal(out.text, "read it all");
+        assert.equal(events.find((ev) => ev["type"] === "tool_result")?.["text"], big);
+        assert.equal(messagesOf(h, sid).find((m) => m.role === "tool")?.content, big);
+        const sent = env.model.requests[1]?.["messages"] as Message[];
+        assert.equal(sent.find((m) => m.role === "tool")?.content, big);
+    } finally {
+        await env.stop();
+    }
+});
+
+test("two results that add up past one channel message are each stored whole, in an append of their own", async () => {
+    const env = await boot();
+    try {
+        const a = "a".repeat(600_000);
+        const b = "b".repeat(600_000);
+        const h = await connected(env, {
+            name: "toto",
+            tools: READ_TOOLS,
+            handlers: { look: { text: a }, read: { text: b } },
+        });
+        const sid = h.createSession();
+        env.model.nextTurn(callTurn([{ id: "c1", name: "look" }, { id: "c2", name: "read" }]));
+        env.model.nextTurn(textTurn("read both"));
+
+        const out = await env.core.runTurn({ agent: "toto", session: sid, text: "go", title: false });
+        assert.equal(out.dropped, false);
+        assert.equal(out.text, "read both");
+        assert.ok(h.socketOpen(), "the agent's session lives on");
+        const stored = messagesOf(h, sid).filter((m) => m.role === "tool");
+        assert.deepEqual(stored.map((m) => m.content === a || m.content === b), [true, true]);
+        const sent = (env.model.requests[1]?.["messages"] as Message[]).filter((m) => m.role === "tool");
+        assert.deepEqual(sent.map((m) => m.content), stored.map((m) => m.content));
+        const appends = h.frames().filter((f) => f["type"] === "append");
+        assert.ok(appends.every((f) => (f["payload"] as { events: unknown[] }).events.length === 1));
+    } finally {
+        await env.stop();
+    }
+});
+
+test("a chain too big for history is refused whole; the agent and its other chats live on", { timeout: 15_000 }, async () => {
+    const env = await boot();
+    try {
+        const h = await connected(env, {
+            name: "toto",
+            manifest: { chain: true },
+            tools: READ_TOOLS,
+            handlers: { look: { text: "y".repeat(600_000) }, read: { text: "READ" } },
+        });
+        h.core.setMisbehavior("read", "silent");
+        // another chat on the same agent, waiting on its own invoke the whole time
+        const other = h.createSession();
+        env.model.nextTurn(callTurn([{ id: "r1", name: "read" }]));
+        const waiting = env.core.turns.start({
+            agent: "toto",
+            session: other,
+            text: "read",
+            attended: true,
+            title: false,
+        });
+        await waitFor(() => h.invokes().length === 1, 4000, "the other chat's invoke");
+
+        const sid = h.createSession();
+        const steps = [{ tool: "look" }, { tool: "look" }];
+        env.model.nextTurn(callTurn([{ id: "c1", name: "chain", args: JSON.stringify({ steps }) }]));
+        env.model.nextTurn(textTurn("asked for less"));
+        const events: Array<Record<string, unknown>> = [];
+        const out = await env.core.runTurn({
+            agent: "toto",
+            session: sid,
+            text: "go",
+            title: false,
+            emit: (ev) => void events.push(ev),
+        });
+        assert.equal(h.invokes().length, 3, "both steps ran");
+        assert.equal(out.dropped, false);
+        assert.equal(out.text, "asked for less");
+        const refused = events.find((ev) => ev["type"] === "tool_result")?.["text"];
+        assert.match(String(refused), /^Error: the result of "chain" is \d+ bytes, over the \d+ .* it was not kept/);
+        assert.equal(messagesOf(h, sid).find((m) => m.role === "tool")?.content, refused);
+        const sent = env.model.requests[2]?.["messages"] as Message[];
+        assert.equal(sent.find((m) => m.role === "tool")?.content, refused);
+
+        assert.ok(h.socketOpen(), "the agent's session lives on");
+        assert.ok(env.core.registry.get("toto"), "and the agent stays registered");
+        let settled = false;
+        void waiting.result.finally(() => {
+            settled = true;
+        });
+        await new Promise((r) => setTimeout(r, 50));
+        assert.equal(settled, false, "the other chat's invoke is still waiting");
+        waiting.stop();
+        assert.equal((await waiting.result).dropped, false);
+    } finally {
+        await env.stop();
+    }
+});
+
+test("a message too big for the channel fails only its own request, never the agent's session", async () => {
+    const env = await boot();
+    try {
+        const h = await connected(env, { name: "toto", tools: READ_TOOLS, handlers: {} });
+        const sid = h.createSession();
+        const out = await env.core.runTurn({ agent: "toto", session: sid, text: "z".repeat(1_100_000), title: false });
+        assert.equal(out.dropped, true, "the turn whose append could not be sent");
+        assert.ok(env.logs.some((l) => /append lost — .*over the 1048576 one channel message carries/.test(l)));
+        assert.ok(h.socketOpen(), "the agent's session lives on");
+
+        env.model.nextTurn(textTurn("still here"));
+        const next = await env.core.runTurn({ agent: "toto", session: sid, text: "hi", title: false });
+        assert.equal(next.text, "still here");
+    } finally {
+        await env.stop();
+    }
+});
+
+test("an invoke with no deadline carries none, outlives the default timeout and is ended by a Stop", { timeout: 15_000 }, async () => {
+    // the peer's 30 s default cut to 400 ms: a model invoke that fell back to it would end on its own
+    const env = await boot({ defaultTimeoutMs: 400 });
+    try {
+        const h = await connected(env, { name: "toto", tools: READ_TOOLS, handlers: { look: { text: "LOOKED" } } });
+        h.core.setMisbehavior("look", "silent");
+        const sid = h.createSession();
+        env.model.nextTurn(callTurn([{ id: "c1", name: "look" }]));
+
+        const events: Array<Record<string, unknown>> = [];
+        const run = env.core.turns.start({
+            agent: "toto",
+            session: sid,
+            text: "go",
+            attended: true,
+            title: false,
+            emit: (ev) => void events.push(ev),
+        });
+        await waitFor(() => h.invokes().length === 1, 4000, "the invoke");
+        assert.equal(h.invokes()[0]?.["deadline"], undefined);
+        // nothing for a mid-invoke approval to be clamped to either
+        assert.equal(env.core.registry.get("toto")?.deadlineAt, undefined);
+
+        // the knob is live: the same silent tool, asked with no timeout of its own, is cut at 400 ms
+        const plain = env.core.registry.get("toto")!.request("invoke", { tool: "look", args: {} });
+        await assert.rejects(plain, /no reply within 400ms/);
+        await new Promise((r) => setTimeout(r, 300));
+        assert.equal(events.some((ev) => ev["type"] === "tool_result"), false, "the model's invoke still waits");
+
+        run.stop();
+        const out = await run.result;
+        assert.equal(out.text, "Stopped by user before completion.");
+        const result = messagesOf(h, sid).find((m) => m.role === "tool");
+        assert.equal(result?.tool_call_id, "c1", "the stopped call still leaves its result");
+    } finally {
+        await env.stop();
+    }
+});
+
+test("an invoke with no deadline ends when the agent disconnects", { timeout: 15_000 }, async () => {
+    const env = await boot();
+    try {
+        const h = await connected(env, { name: "toto", tools: READ_TOOLS, handlers: { look: { text: "LOOKED" } } });
+        h.core.setMisbehavior("look", "silent");
+        const sid = h.createSession();
+        env.model.nextTurn(callTurn([{ id: "c1", name: "look" }]));
+
+        const turn = env.core.runTurn({ agent: "toto", session: sid, text: "go", attended: true, title: false });
+        await waitFor(() => h.invokes().length === 1, 4000, "the invoke");
+        h.close();
+        assert.equal((await turn).dropped, true, "the agent is gone, so is the turn");
+    } finally {
+        await env.stop();
+    }
+});
+
 test("an agent that dies mid-batch drops the turn cleanly, nothing is replayed", async () => {
     const env = await boot();
     try {
@@ -851,6 +1041,39 @@ test("an approval asked mid-invoke expires with the invoke, whatever session it 
         const gate = env.core.approvals.pending()[0]!;
         const left = gate.deadline - Date.now();
         assert.ok(left > 0 && left <= 2_000, `the card must not outlive the invoke, ${left}ms left`);
+
+        env.core.approvals.answer(gate.gate, { a1: true });
+        assert.equal((await turn).text, "done");
+    } finally {
+        await env.stop();
+    }
+});
+
+test("with no invoke deadline, an approval asked mid-invoke keeps its own five minutes", async () => {
+    const env = await boot();
+    try {
+        let agent: Harness | null = null;
+        const h = await connected(env, {
+            name: "toto",
+            tools: [{ name: "wire", writes: false, parameters: { type: "object", properties: {} } }],
+            handlers: {
+                wire: async () => {
+                    agent?.send({ id: "mid", type: "ask_approve", payload: { label: "send 40 EUR" } });
+                    await waitFor(() => env.core.approvals.pending().length === 0, 4000, "the answer");
+                    return { text: "WIRED" };
+                },
+            },
+        });
+        agent = h;
+        const sid = h.createSession();
+        env.model.nextTurn(callTurn([{ id: "w1", name: "wire" }]));
+        env.model.nextTurn(textTurn("done"));
+
+        const turn = env.core.runTurn({ agent: "toto", session: sid, text: "go", attended: true, title: false });
+        await waitFor(() => env.core.approvals.pending().length === 1, 4000, "the mid-invoke gate");
+        const gate = env.core.approvals.pending()[0]!;
+        const left = gate.deadline - Date.now();
+        assert.ok(left > 4 * 60_000 && left <= 5 * 60_000, `the approval's own timeout applies, ${left}ms left`);
 
         env.core.approvals.answer(gate.gate, { a1: true });
         assert.equal((await turn).text, "done");

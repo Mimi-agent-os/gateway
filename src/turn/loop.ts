@@ -22,7 +22,6 @@ import {
     thresholdsFor,
     toolTrafficSummary,
 } from "./compaction.ts";
-import { cap } from "./chain.ts";
 import type { GateAction, GateContext } from "../gates/gate-types.ts";
 import { buildGatewayTools, type GatewayToolCtx } from "./gateway-tools.ts";
 import { systemPrompt, visibleTo } from "./prompt.ts";
@@ -30,9 +29,7 @@ import { createProvider } from "../llm/models.ts";
 import { admitAtDequeue, LimitReached, resolveModelFor } from "../llm/policy.ts";
 import { enqueueCall, type CallPriority } from "../llm/queue.ts";
 import {
-    INVOKE_DEADLINE_MS,
     MAX_TOOL_TURNS,
-    TOOL_OUTPUT_MAX,
     type LoopDeps,
     type PlannedCall,
     type RuntimeTool,
@@ -41,11 +38,16 @@ import {
     type TurnOutcome,
     type TurnRequest,
 } from "./loop-types.ts";
+import { MAX_STREAM0_BYTES } from "../registry/devices.ts";
 import { PeerError } from "../registry/peer.ts";
 
 const DENIED =
     "The user DENIED this tool call (or no interactive approval is available in this run). " +
     "Do not retry it; report the denial in your answer.";
+
+/** What one stored event may serialize to: its append, and the events_after page that later
+ *  carries it back, must each fit one channel message with the frame around it. */
+const STORED_EVENT_MAX_BYTES = MAX_STREAM0_BYTES - 4_096;
 
 /** A line the gateway itself wrote — no agent said it, and no model call produced it. */
 const SYSTEM_NOTE: MessageMeta = { actor: { kind: "system" } };
@@ -95,7 +97,7 @@ export async function runTurn(deps: LoopDeps, req: TurnRequest): Promise<TurnOut
     let queueKey = cfg.endpointUrl;
     let usedFallback = false;
     const priority: CallPriority = req.priority ?? "interactive";
-    const deadlineMs = req.invokeDeadlineMs ?? INVOKE_DEADLINE_MS;
+    const deadlineMs = req.invokeDeadlineMs;
 
     const policy = peer.describe?.manifest.policy;
     const allowed = policy?.allowedTools ? new Set(policy.allowedTools) : null;
@@ -162,30 +164,29 @@ export async function runTurn(deps: LoopDeps, req: TurnRequest): Promise<TurnOut
             return [];
         }
         try {
-            const ok = await peer.request("append", {
-                session,
-                events: [...bodies],
-            }, { signal });
-            deps.sessions.applyAppend(agent, session, bodies, ok.head);
-            // an agent that answers without `seqs` loses the association, never the turn
-            const seqs = Array.isArray(ok.seqs) ? ok.seqs : [];
-            if (roundCallId !== null) {
-                const mine = bodies.flatMap((b, i) => {
-                    if (b.type !== "message") return [];
-                    const role = (b.payload as Message).role;
-                    const seq = seqs[i];
-                    return (role === "assistant" || role === "tool") && seq !== undefined ? [seq] : [];
-                });
-                if (mine.length) {
-                    roundSeqs.push(...mine);
-                    try {
-                        deps.db.setLlmCallMessages(roundCallId, roundSeqs);
-                    } catch {
-                        /* the association is a trace, never worth the turn */
-                    }
+            const seqs: number[] = [];
+            const mine: number[] = [];
+            // one event per request: each fits a channel message on its own (STORED_EVENT_MAX_BYTES),
+            // a round's whole results together need not
+            for (const body of bodies) {
+                const ok = await peer.request("append", { session, events: [body] }, { signal });
+                deps.sessions.applyAppend(agent, session, [body], ok.head);
+                // an agent that answers without `seqs` loses the association, never the turn
+                const seq = Array.isArray(ok.seqs) ? ok.seqs[0] : undefined;
+                if (seq === undefined) continue;
+                seqs.push(seq);
+                const role = body.type === "message" ? (body.payload as Message).role : null;
+                if (role === "assistant" || role === "tool") mine.push(seq);
+            }
+            if (roundCallId !== null && mine.length) {
+                roundSeqs.push(...mine);
+                try {
+                    deps.db.setLlmCallMessages(roundCallId, roundSeqs);
+                } catch {
+                    /* the association is a trace, never worth the turn */
                 }
             }
-            return [...seqs];
+            return seqs;
         } catch (e) {
             deps.log(
                 `[loop] ${where}: append lost — ${(e as Error).message}; ` +
@@ -276,7 +277,15 @@ export async function runTurn(deps: LoopDeps, req: TurnRequest): Promise<TurnOut
         const invoke: InvokePayload = { tool: name, args };
         // a room turn names no session: the agent has no conversation behind this call
         if (session !== null) invoke.session = session;
-        const r = await peer.request("invoke", invoke, { deadline: deadlineMs, signal: req.signal });
+        // without a deadline the gateway sets no timer at all: the invoke waits for the agent's
+        // answer, a Stop (req.signal) or the socket closing
+        const r = await peer.request(
+            "invoke",
+            invoke,
+            deadlineMs === undefined
+                ? { timeoutMs: null, signal: req.signal }
+                : { deadline: deadlineMs, signal: req.signal },
+        );
         return { text: typeof r.text === "string" ? r.text : "", data: r.data };
     }
 
@@ -609,7 +618,7 @@ export async function runTurn(deps: LoopDeps, req: TurnRequest): Promise<TurnOut
                     } catch (e) {
                         const status = e instanceof PeerError ? e.status : "error";
                         out =
-                            status === "timeout"
+                            status === "timeout" && deadlineMs !== undefined
                                 ? `Error: "${call.name}" did not answer within ${deadlineMs}ms — treat it as not done.`
                                 : status === "denied"
                                   ? `Denied: the agent refused "${call.name}".`
@@ -617,9 +626,20 @@ export async function runTurn(deps: LoopDeps, req: TurnRequest): Promise<TurnOut
                     }
                 }
             }
-            out = cap(out, TOOL_OUTPUT_MAX);
+            // whole, however big: the model, the live event and history all get the same text. Only
+            // a result that cannot be stored at all is refused — whole, never cut — and the model
+            // hears why; a room turn stores nothing, so its model gets anything
+            let result = messageEvent({ role: "tool", tool_call_id: call.id, content: out });
+            const bytes = session === null ? 0 : Buffer.byteLength(JSON.stringify(result.payload), "utf8");
+            if (bytes > STORED_EVENT_MAX_BYTES) {
+                out =
+                    `Error: the result of "${call.name}" is ${bytes} bytes, over the ` +
+                    `${STORED_EVENT_MAX_BYTES} one message to the agent's history can carry — it was ` +
+                    `not kept. Ask for less at a time.`;
+                result = messageEvent({ role: "tool", tool_call_id: call.id, content: out });
+            }
             emit?.({ type: "tool_result", id: call.id, name: call.name, text: out });
-            results.push(messageEvent({ role: "tool", tool_call_id: call.id, content: out }));
+            results.push(result);
         }
 
         if (req.signal?.aborted) return stopped(results);

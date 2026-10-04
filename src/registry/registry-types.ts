@@ -27,7 +27,9 @@ export interface IncomingRequest {
 export interface RequestOptions {
     /** Relative ms budget put on the wire; the peer counts it from receipt. */
     deadline?: number;
-    timeoutMs?: number;
+    /** How long to wait for the reply here: by default the deadline plus a grace, else 30 s. null
+     *  sets no timer at all — only the reply, `signal` or the socket closing settles the request. */
+    timeoutMs?: number | null;
     /** Stops waiting locally. The protocol has no remote cancellation frame. */
     signal?: AbortSignal | undefined;
 }

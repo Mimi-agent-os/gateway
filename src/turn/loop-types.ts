@@ -47,6 +47,8 @@ interface TurnOptions {
     /** Recursion guard for ask_<agent>; a delegate turn runs at depth 1 and delegates nothing. */
     depth?: number | undefined;
     title?: boolean | undefined;
+    /** A deadline put on every invoke of this turn. Unset (the default), an invoke has none: it waits
+     *  until the agent answers, the turn is stopped or the agent disconnects. */
     invokeDeadlineMs?: number | undefined;
 }
 
@@ -97,6 +99,3 @@ export interface PlannedCall {
 }
 
 export const MAX_TOOL_TURNS = 25;
-/** Where a tool result crosses into history — every path goes through this one ceiling. */
-export const TOOL_OUTPUT_MAX = 20_000;
-export const INVOKE_DEADLINE_MS = 120_000;
