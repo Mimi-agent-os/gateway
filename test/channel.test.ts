@@ -3,6 +3,7 @@ import "./pq-home.ts";
 /** The secure-channel device plane over real sockets: pairing, sessions, decisions, bounds, ops. */
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
+import { once } from "node:events";
 import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage } from "node:http";
 import { connect, Socket, type AddressInfo } from "node:net";
@@ -13,6 +14,7 @@ import test from "node:test";
 
 import {
     ClientSession,
+    CLOSE_NOT_PAIRED,
     FLAG_DATA,
     FLAG_END,
     FLAG_RESET,
@@ -79,6 +81,19 @@ async function nextJson(live: RawSession): Promise<Record<string, unknown> | nul
     assert.equal(f.stream, 0);
     return JSON.parse(new TextDecoder().decode(f.payload)) as Record<string, unknown>;
 }
+
+/** Runs the handshake by hand until the gateway turns the key away, and resolves with its close code and reason. */
+async function refusal(env: Env, s: Uint8Array, gatewayPub = env.core.devices.gatewayPub): Promise<[number, string]> {
+    const client = new ClientSession({ s, gatewayPub, protocol: PROTOCOL_VERSION });
+    const w = await dialRaw(env, "/channel");
+    const closed = once(w.ws, "close") as Promise<[number, Buffer]>;
+    w.send(client.start());
+    for (let bytes = await w.next(); bytes !== null; bytes = await w.next()) w.send(client.feed(bytes).out);
+    const [code, reason] = await closed;
+    return [code, reason.toString("utf8")];
+}
+
+const NOT_PAIRED: [number, string] = [CLOSE_NOT_PAIRED, "not paired with this gateway"];
 
 async function deviceRow(env: Env, name: string): Promise<Record<string, unknown>> {
     const r = await env.api<{ devices: Array<Record<string, unknown>> }>("GET", "/api/devices");
@@ -284,6 +299,33 @@ test("an unknown key is closed only after msg2 and the kem step", async () => {
         assert.equal(w.closed, false);
         w.send(r.out);
         assert.equal(await w.next(), null);
+    } finally {
+        await env.stop();
+    }
+});
+
+test("a handshake that does not authenticate closes as not paired: another gateway's key, an unknown key, a revoked device", async () => {
+    const env = await boot();
+    try {
+        const { s, id } = await activeDevice(env, "desk");
+        assert.deepEqual(await refusal(env, s, new Uint8Array(randomBytes(32))), NOT_PAIRED, "pinned to another gateway's key");
+        assert.deepEqual(await refusal(env, new Uint8Array(randomBytes(32))), NOT_PAIRED, "a key this gateway never paired");
+
+        const live = await rawSession(env, s);
+        assert.ok(live, "the same device still connects with the right gateway key");
+        const dropped = once(live.ws, "close") as Promise<[number, Buffer]>;
+        assert.deepEqual((await env.api("POST", `/api/devices/${id}/revoke`)).json, { ok: true });
+        assert.equal((await dropped)[0], 1000, "a revoke still closes a live session as before");
+        assert.deepEqual(await refusal(env, s), NOT_PAIRED, "a revoked device");
+
+        // the right gateway key and then an unreadable kem record: a broken session, not an unpaired one
+        const client = new ClientSession({ s: new Uint8Array(randomBytes(32)), gatewayPub: env.core.devices.gatewayPub, protocol: PROTOCOL_VERSION });
+        const w = await dialRaw(env, "/channel");
+        const closed = once(w.ws, "close") as Promise<[number, Buffer]>;
+        w.send(client.start());
+        assert.ok(await w.next());
+        w.send([Buffer.concat([Buffer.from([0x04, 0xb0]), randomBytes(1200)])]);
+        assert.equal((await closed)[0], 1000);
     } finally {
         await env.stop();
     }
@@ -811,7 +853,7 @@ test("agents never take the slots kept for devices: a new agent is turned away, 
         const one = await rawSession(env, keys.get("one")!);
         const two = await rawSession(env, keys.get("two")!);
         assert.ok(one && two);
-        assert.equal(await rawSession(env, keys.get("three")!), null, "a third agent is refused at the lookup");
+        assert.deepEqual(await refusal(env, keys.get("three")!), [1000, ""], "a third agent is refused at the lookup, for room, not as unpaired");
         const again = await rawSession(env, keys.get("one")!);
         assert.ok(again, "an agent already inside may still replace its own session");
         assert.equal(await one.frame(), null);

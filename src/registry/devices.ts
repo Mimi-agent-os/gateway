@@ -10,6 +10,7 @@ import { dirname, join } from "node:path";
 import type { Duplex } from "node:stream";
 
 import {
+    CLOSE_NOT_PAIRED,
     fingerprint,
     FLAG_DATA,
     FLAG_END,
@@ -101,6 +102,8 @@ const X25519_PKCS8 = Buffer.from("302e020100300506032b656e04220420", "hex");
 const REFUSED_UPGRADE = "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
 /** Channel slots agents can never take, so no number of agent sessions locks the owner's devices out. */
 const DEVICE_SLOTS = 16;
+/** One reason for a wrong gateway key and an unknown or revoked device alike: the close says no more. */
+const NOT_PAIRED = "not paired with this gateway";
 
 type InviteKind = "device" | "local" | "agent";
 
@@ -145,6 +148,10 @@ interface Conn {
     agentName: string | null;
     pending: boolean;
     ready: boolean;
+    /** msg1 decrypted: the client sealed it to this gateway's key. */
+    hello: boolean;
+    /** The lookup turned the client's key away as unknown or revoked, not for capacity. */
+    unpaired: boolean;
     heardAt: number;
     streams: Map<number, Stream>;
     /** Agent sessions only: the next id openAppStream hands out — only the gateway opens here. */
@@ -503,6 +510,8 @@ export class DeviceService {
             agentName: null,
             pending: false,
             ready: false,
+            hello: false,
+            unpaired: false,
             heardAt: this.#now(),
             streams: new Map(),
             nextStream: 1,
@@ -529,7 +538,11 @@ export class DeviceService {
                     const pubkey = Buffer.from(clientPub).toString("base64");
                     const device = this.#db.deviceByPubkey(pubkey);
                     if (device) {
-                        if (device.status === "revoked" || !sock.open) return "reject";
+                        if (!sock.open) return "reject";
+                        if (device.status === "revoked") {
+                            conn.unpaired = true;
+                            return "reject";
+                        }
                         conn.role = "device";
                         conn.deviceId = device.id;
                         conn.pending = device.status === "inactive";
@@ -546,7 +559,11 @@ export class DeviceService {
                         return conn.pending ? "pending" : "active";
                     }
                     const pin = this.#db.pinByPubkey(pubkey);
-                    if (!pin || pin.status !== "approved" || !sock.open) return "reject";
+                    if (!sock.open) return "reject";
+                    if (!pin || pin.status !== "approved") {
+                        conn.unpaired = true;
+                        return "reject";
+                    }
                     let others = 0;
                     for (const c of this.#all) if (c.role === "agent" && c.agentName !== pin.name) others++;
                     if (others >= this.#maxSessions - DEVICE_SLOTS) return "reject";
@@ -729,15 +746,19 @@ export class DeviceService {
         try {
             r = session.feed(bytes);
         } catch {
-            conn.sock.close(1000);
+            // a msg1 that does not decrypt was sealed to another gateway key
+            if (conn.hello) conn.sock.close(1000);
+            else conn.sock.close(CLOSE_NOT_PAIRED, NOT_PAIRED);
             return;
         }
         conn.heardAt = this.#now();
         for (const out of r.out) conn.sock.sendBinary(out);
         for (const ev of r.events) {
             if (!conn.sock.open) return;
+            if (ev.type === "hello") conn.hello = true;
             if (ev.type === "close") {
-                conn.sock.close(1000);
+                if (conn.unpaired) conn.sock.close(CLOSE_NOT_PAIRED, NOT_PAIRED);
+                else conn.sock.close(1000);
                 return;
             }
             if (ev.type === "ready") {
