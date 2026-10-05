@@ -2,9 +2,9 @@
 
 import type { SessionId } from "@mimi-os/protocol";
 
-import { newCallId, recordLlmCall } from "../store/accounting.ts";
+import { estimateUsage, newCallId, recordLlmCall } from "../store/accounting.ts";
 import { gatewayDb, type GatewayDb } from "../store/db.ts";
-import type { ProviderResponse } from "../llm/base/index.ts";
+import { NotSentError, type ProviderResponse } from "../llm/base/index.ts";
 import { createProvider, getDefaultModel, getModel } from "../llm/models.ts";
 import { admitAtDequeue } from "../llm/policy.ts";
 import { enqueueCall } from "../llm/queue.ts";
@@ -88,18 +88,21 @@ export async function autoTitle(opts: AutoTitleOptions): Promise<boolean> {
         for (let attempt = 1; attempt <= 2; attempt++) {
             const t0 = performance.now();
             const callId = newCallId();
-            let r: ProviderResponse | null = null;
+            // filled as it streams: a call that throws keeps what the provider already sent
+            const got: ProviderResponse = { thinking: "", text: "", toolCalls: [], finishReason: "error" };
+            // the signal the call ran with, set at dequeue: null means it never left the queue
+            let sent = null as AbortSignal | null;
             let failed: unknown = null;
             try {
                 // the same per-endpoint queue as every turn: a one-slot server never sees two calls
-                r = await enqueueCall(
+                await enqueueCall(
                     cfg.endpointUrl,
                     () => {
                         // the same gate as every other call of this agent, at dequeue: pause, grant, daily limit
                         admitAtDequeue(agent, cfg, db);
                         const timeout = AbortSignal.timeout(TITLE_TIMEOUT_MS);
-                        const signal = opts.signal ? AbortSignal.any([opts.signal, timeout]) : timeout;
-                        return provider.complete(request, [], signal);
+                        sent = opts.signal ? AbortSignal.any([opts.signal, timeout]) : timeout;
+                        return provider.complete(request, [], sent, got);
                     },
                     "background",
                     opts.signal,
@@ -108,6 +111,14 @@ export async function autoTitle(opts: AutoTitleOptions): Promise<boolean> {
                 failed = e;
                 log(`[title] ${agent}#${session}: ${(e as Error).message}\n`);
             }
+            // as a turn: a call the provider had but never reported is estimated, never free
+            const estimate =
+                got.usage === undefined &&
+                sent !== null &&
+                !(failed instanceof NotSentError) &&
+                (got.accepted === true || sent.aborted)
+                    ? estimateUsage(request, [], got.thinking + got.text)
+                    : undefined;
             recordLlmCall(
                 {
                     agent,
@@ -119,21 +130,23 @@ export async function autoTitle(opts: AutoTitleOptions): Promise<boolean> {
                     provider: cfg.provider,
                     registryModel: cfg.name,
                     modelUid: cfg.modelUid,
-                    reportedModel: r?.model ?? null,
+                    reportedModel: got.model ?? null,
                     attempt,
                     parentCallId,
                     turnSeq: opts.turnSeq ?? null,
-                    finishReason: r?.finishReason ?? "error",
-                    usage: r?.usage,
+                    finishReason: failed ? "error" : got.finishReason,
+                    usage: got.usage ?? estimate,
+                    usageEstimated: estimate !== undefined,
+                    dispatched: sent !== null,
                     durationMs: Math.round(performance.now() - t0),
-                    raw: r ? { text: r.text, finishReason: r.finishReason } : { error: String(failed) },
+                    raw: failed ? { error: String(failed) } : { text: got.text, finishReason: got.finishReason },
                 },
                 db,
             );
             if (opts.signal?.aborted) return false;
             if (failed instanceof PeerError) break;
             parentCallId = callId;
-            const title = r && parseTitle(r.text);
+            const title = !failed && parseTitle(got.text);
             if (title) {
                 return (await peer.request("session_update", { session, title }, { signal: opts.signal })).applied;
             }

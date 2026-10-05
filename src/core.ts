@@ -28,6 +28,7 @@ import { estimateUsage, newCallId, recordLlmCall, setUsageRecordedHook } from ".
 import { gatewayDb, type GatewayDb } from "./store/db.ts";
 import type { GateCard, GateContext, GateSummary } from "./gates/gate-types.ts";
 import { Gates } from "./gates/gates.ts";
+import { NotSentError } from "./llm/base/index.ts";
 import { createProvider } from "./llm/models.ts";
 import { admitAtDequeue, LimitReached, resolveModelFor } from "./llm/policy.ts";
 import { enqueueCall } from "./llm/queue.ts";
@@ -511,6 +512,8 @@ export function createGatewayCore(opts: GatewayCoreOptions = {}): GatewayCore {
             lastCallId = callId;
             let firstOutputMs: number | null = null;
             let dispatched = false;
+            let accepted = false;
+            let toolArgs = "";
             const sent = visibleTo(cfg.vision, messages);
             try {
                 await enqueueCall(
@@ -524,13 +527,18 @@ export function createGatewayCore(opts: GatewayCoreOptions = {}): GatewayCore {
                             // same clock as a turn round: queue INCLUDED, an empty delta is not output
                             if (
                                 firstOutputMs === null &&
-                                (ev.type === "text" || ev.type === "thinking"
-                                    ? ev.text !== ""
-                                    : ev.type === "tool_calls" && ev.calls.length > 0)
+                                (ev.type === "text" || ev.type === "thinking" || ev.type === "tool_args") &&
+                                ev.text !== ""
                             ) {
                                 firstOutputMs = Math.round(performance.now() - t0);
                             }
                             switch (ev.type) {
+                                case "accepted":
+                                    accepted = true;
+                                    continue;
+                                case "tool_args":
+                                    toolArgs += ev.text;
+                                    continue;
                                 case "thinking":
                                     thinking += ev.text;
                                     break;
@@ -557,8 +565,8 @@ export function createGatewayCore(opts: GatewayCoreOptions = {}): GatewayCore {
             }
             // as a turn round: a call the provider had but never reported is estimated, never free
             const estimate =
-                usage === undefined && dispatched && (firstOutputMs !== null || signal.aborted)
-                    ? estimateUsage(sent, tools, thinking + text + toolCalls.map((c) => c.name + c.arguments).join(""))
+                usage === undefined && dispatched && !(failed instanceof NotSentError) && (accepted || signal.aborted)
+                    ? estimateUsage(sent, tools, thinking + text + toolArgs)
                     : undefined;
             recordLlmCall(
                 {
@@ -577,6 +585,7 @@ export function createGatewayCore(opts: GatewayCoreOptions = {}): GatewayCore {
                     finishReason: failed ? "error" : finishReason,
                     usage: usage ?? estimate,
                     usageEstimated: estimate !== undefined,
+                    dispatched,
                     durationMs: Math.round(performance.now() - t0),
                     firstOutputMs,
                     raw: failed

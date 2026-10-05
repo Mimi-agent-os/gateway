@@ -83,12 +83,13 @@ export interface NewLlmCall {
     cachedTokens?: number | null;
     /** Provider-reported only, and a subset of completionTokens: it enters no total, ever. */
     reasoningTokens?: number | null;
-    /** The usage is the gateway's own chars/4 estimate: the call was stopped or failed after the provider had it. */
+    /** The usage is the gateway's own chars/4 estimate: the provider had the call and never reported (stopped, failed, or no usage sent). */
     usageEstimated?: boolean;
-    /** The gateway adapter this call ran through, frozen at call time — never the downstream host. */
+    /** The gateway adapter this call ran through, frozen at call time — never the downstream host; null
+     *  for a call that never left the gateway, which is a trace row and no timing sample. */
     provider?: string | null;
     durationMs?: number | null;
-    /** Call start (queue included) to the first nonempty text/thinking/tool_calls event. */
+    /** Call start (queue included) to the first nonempty text, thinking or tool-call delta. */
     firstOutputMs?: number | null;
     tokensPerSec?: number | null;
     raw: unknown;
@@ -144,7 +145,7 @@ export interface CallPerfRow {
 /** Every rollup read: `totalTokens` is prompt + completion, `cost` those tokens at each model's CURRENT price. */
 export interface UsageTotals {
     calls: number;
-    /** Calls whose usage is the gateway's estimate (stopped or failed mid-stream). */
+    /** Calls whose usage is the gateway's estimate (the provider had them and never reported). */
     estimatedCalls: number;
     promptTokens: number;
     completionTokens: number;
@@ -497,8 +498,8 @@ const LAST_ALIAS = `MAX(printf('%015d', last_write) || registry_model)`;
 const lastAlias = (v: unknown): string | null => textCol(v)?.slice(15) ?? null;
 /** The usage window every rollup read shares; a null `:agent` means every agent. */
 const USAGE_WINDOW = `day >= :since AND (:agent IS NULL OR agent = :agent)`;
-/** usage_daily priced at each model's CURRENT price; a cell no registry row prices costs 0. */
-const PRICED_USAGE = `(SELECT u.*, token_cost(u.prompt_tokens, u.completion_tokens, m.price_in_per_m, m.price_out_per_m) AS cost
+/** usage_daily priced at each model's CURRENT price, beside its current name; a cell no registry row prices costs 0. */
+const PRICED_USAGE = `(SELECT u.*, m.name AS model_name, token_cost(u.prompt_tokens, u.completion_tokens, m.price_in_per_m, m.price_out_per_m) AS cost
     FROM usage_daily u LEFT JOIN models m ON m.model_uid = u.model_uid)`;
 const ROLLUP_SUMS = `SUM(calls) AS calls, SUM(estimated_calls) AS estimated_calls, SUM(prompt_tokens) AS prompt,
     SUM(completion_tokens) AS completion, SUM(cost) AS cost`;
@@ -974,7 +975,8 @@ export class GatewayDb {
 
     /** The retained tail's measured columns, oldest first — the numbers that outlive a raw prune.
      *  `since` is a UTC `YYYY-MM-DD HH:MM:SS` stamp; `model: ""` is the calls that named no model;
-     *  an estimated completion is no measurement of speed, so it reads null. */
+     *  an estimated completion is no measurement of speed, so it reads null; a call that never left
+     *  the gateway is no sample at all. */
     perfCalls(since: string, filter: { agent?: string | null; model?: string | null } = {}): CallPerfRow[] {
         return this.db
             .prepare(
@@ -982,7 +984,7 @@ export class GatewayDb {
                         CASE WHEN usage_estimated = 0 THEN completion_tokens END AS completion_tokens,
                         duration_ms, first_output_ms
                  FROM llm_calls
-                 WHERE created_at >= :since AND call_kind IS NOT 'ping'
+                 WHERE created_at >= :since AND call_kind IS NOT 'ping' AND provider IS NOT NULL
                    AND (:agent IS NULL OR agent = :agent)
                    AND (:model IS NULL OR (:model = '' AND (model IS NULL OR model = '')) OR model = :model)
                  ORDER BY id`,
@@ -1006,7 +1008,8 @@ export class GatewayDb {
         };
         const gaps = this.db
             .prepare(
-                `SELECT COUNT(*) AS n FROM llm_calls WHERE created_at >= ? AND duration_ms IS NULL AND call_kind IS NOT 'ping'`,
+                `SELECT COUNT(*) AS n FROM llm_calls
+                 WHERE created_at >= ? AND duration_ms IS NULL AND call_kind IS NOT 'ping' AND provider IS NOT NULL`,
             )
             .get(since) as { n: number };
         return { oldest: textCol(oldest.at), unmeasured: Number(gaps.n) };
@@ -1120,11 +1123,12 @@ export class GatewayDb {
             }));
     }
 
-    /** The whole window again, bucketed by registry identity: same rows, same grand totals, other key. */
+    /** The whole window again, bucketed by registry identity: same rows, same grand totals, other key.
+     *  A model still in the registry reads as its name now; a removed one as its last alias. */
     usageByRegistry(sinceDay: string, agent?: string): RegistryUsageRow[] {
         return this.db
             .prepare(
-                `SELECT model_uid, ${LAST_ALIAS} AS registry_model, ${ROLLUP_SUMS}
+                `SELECT model_uid, MAX(model_name) AS model_name, ${LAST_ALIAS} AS registry_model, ${ROLLUP_SUMS}
                  FROM ${PRICED_USAGE} WHERE ${USAGE_WINDOW}
                  GROUP BY model_uid
                  ORDER BY SUM(prompt_tokens) + SUM(completion_tokens) DESC, model_uid`,
@@ -1132,7 +1136,7 @@ export class GatewayDb {
             .all({ since: sinceDay, agent: agent ?? null })
             .map((row) => ({
                 modelUid: textCol(row["model_uid"]) || null,
-                registryModel: lastAlias(row["registry_model"]),
+                registryModel: textCol(row["model_name"]) ?? lastAlias(row["registry_model"]),
                 ...toTotals(row),
             }));
     }

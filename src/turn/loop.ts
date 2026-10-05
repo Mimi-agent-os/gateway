@@ -25,6 +25,7 @@ import {
 import type { GateAction, GateContext } from "../gates/gate-types.ts";
 import { buildGatewayTools, type GatewayToolCtx } from "./gateway-tools.ts";
 import { systemPrompt, visibleTo } from "./prompt.ts";
+import { NotSentError } from "../llm/base/index.ts";
 import { createProvider } from "../llm/models.ts";
 import { admitAtDequeue, LimitReached, resolveModelFor } from "../llm/policy.ts";
 import { enqueueCall, type CallPriority } from "../llm/queue.ts";
@@ -373,6 +374,8 @@ export async function runTurn(deps: LoopDeps, req: TurnRequest): Promise<TurnOut
             roundSeqs = [];
             let firstOutputMs: number | null = null;
             let dispatched = false;
+            let accepted = false;
+            let toolArgs = "";
             const sent = visibleTo(cfg.vision, history);
             try {
                 await enqueueCall(
@@ -386,13 +389,18 @@ export async function runTurn(deps: LoopDeps, req: TurnRequest): Promise<TurnOut
                             // queue INCLUDED (t0 precedes enqueueCall); an empty delta is not output
                             if (
                                 firstOutputMs === null &&
-                                (ev.type === "text" || ev.type === "thinking"
-                                    ? ev.text !== ""
-                                    : ev.type === "tool_calls" && ev.calls.length > 0)
+                                (ev.type === "text" || ev.type === "thinking" || ev.type === "tool_args") &&
+                                ev.text !== ""
                             ) {
                                 firstOutputMs = Math.round(performance.now() - t0);
                             }
                             switch (ev.type) {
+                                case "accepted":
+                                    accepted = true;
+                                    continue;
+                                case "tool_args":
+                                    toolArgs += ev.text;
+                                    continue;
                                 case "thinking":
                                     thinking += ev.text;
                                     break;
@@ -424,8 +432,11 @@ export async function runTurn(deps: LoopDeps, req: TurnRequest): Promise<TurnOut
             // but never reported (stopped, or failed mid-stream) still spent, so it is estimated
             const durationMs = Math.round(performance.now() - t0);
             const estimate =
-                usage === undefined && dispatched && (firstOutputMs !== null || req.signal?.aborted === true)
-                    ? estimateUsage(sent, schemas, thinking + text + calls.map((c) => c.name + c.arguments).join(""))
+                usage === undefined &&
+                dispatched &&
+                !(failed instanceof NotSentError) &&
+                (accepted || req.signal?.aborted === true)
+                    ? estimateUsage(sent, schemas, thinking + text + toolArgs)
                     : undefined;
             recordLlmCall(
                 {
@@ -446,6 +457,7 @@ export async function runTurn(deps: LoopDeps, req: TurnRequest): Promise<TurnOut
                     finishReason: failed ? "error" : finishReason,
                     usage: usage ?? estimate,
                     usageEstimated: estimate !== undefined,
+                    dispatched,
                     durationMs,
                     firstOutputMs,
                     raw: failed

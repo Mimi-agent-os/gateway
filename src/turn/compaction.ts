@@ -2,11 +2,11 @@
 
 import type { FoldedEntry, Message, SessionId } from "@mimi-os/protocol";
 
-import type { ProviderResponse } from "../llm/base/index.ts";
+import { NotSentError, type ProviderResponse } from "../llm/base/index.ts";
 import { createProvider, type ModelConfig } from "../llm/models.ts";
 import { admitAtDequeue } from "../llm/policy.ts";
 import { enqueueCall } from "../llm/queue.ts";
-import { newCallId, recordLlmCall } from "../store/accounting.ts";
+import { estimateUsage, newCallId, recordLlmCall } from "../store/accounting.ts";
 import { gatewayDb, type GatewayDb } from "../store/db.ts";
 
 export interface Thresholds {
@@ -61,18 +61,21 @@ export async function summarize(call: SummaryCall, lines: readonly string[], db:
     ];
     const t0 = performance.now();
     let model: string | null = null;
-    let r: ProviderResponse | null = null;
+    // filled as it streams: a call that throws keeps what the provider already sent
+    const got: ProviderResponse = { thinking: "", text: "", toolCalls: [], finishReason: "error" };
+    let dispatched = false;
     let failed: unknown = null;
     // the model row may have changed since the turn began: a provider that cannot be built skips compaction, never fails the turn
     try {
         const provider = createProvider(cfg.name, db);
         model = provider.model ?? null;
-        r = await enqueueCall(
+        await enqueueCall(
             cfg.endpointUrl,
             () => {
                 // the same gate as every other call of this agent, at dequeue: pause, grant, daily limit
                 admitAtDequeue(agent, cfg, db);
-                return provider.complete(request, [], signal);
+                dispatched = true;
+                return provider.complete(request, [], signal, got);
             },
             "background",
             signal,
@@ -80,6 +83,14 @@ export async function summarize(call: SummaryCall, lines: readonly string[], db:
     } catch (e) {
         failed = e;
     }
+    // as a turn: a call the provider had but never reported is estimated, never free
+    const estimate =
+        got.usage === undefined &&
+        dispatched &&
+        !(failed instanceof NotSentError) &&
+        (got.accepted === true || signal?.aborted === true)
+            ? estimateUsage(request, [], got.thinking + got.text)
+            : undefined;
     recordLlmCall(
         {
             agent,
@@ -91,18 +102,20 @@ export async function summarize(call: SummaryCall, lines: readonly string[], db:
             provider: cfg.provider,
             registryModel: cfg.name,
             modelUid: cfg.modelUid,
-            reportedModel: r?.model ?? null,
+            reportedModel: got.model ?? null,
             attempt: 1,
             parentCallId: null,
             turnSeq: call.turnSeq,
-            finishReason: r?.finishReason ?? "error",
-            usage: r?.usage,
+            finishReason: failed ? "error" : got.finishReason,
+            usage: got.usage ?? estimate,
+            usageEstimated: estimate !== undefined,
+            dispatched,
             durationMs: Math.round(performance.now() - t0),
-            raw: r ? { text: r.text, finishReason: r.finishReason } : { error: String(failed) },
+            raw: failed ? { error: String(failed) } : { text: got.text, finishReason: got.finishReason },
         },
         db,
     );
-    return r?.finishReason === "stop" ? r.text.trim() || null : null;
+    return !failed && got.finishReason === "stop" ? got.text.trim() || null : null;
 }
 
 const fraction = (v: unknown, fallback: number): number =>

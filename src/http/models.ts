@@ -1,3 +1,5 @@
+import type { Message } from "@mimi-os/protocol";
+
 import {
     addModel,
     apiKeyEnv,
@@ -11,8 +13,8 @@ import {
     setDefaultModel,
 } from "../llm/models.ts";
 import type { ModelConfig } from "../llm/models.ts";
-import type { ProviderResponse } from "../llm/base/index.ts";
-import { newCallId, PING_AGENT, recordLlmCall } from "../store/accounting.ts";
+import { NotSentError, type ProviderResponse } from "../llm/base/index.ts";
+import { estimateUsage, newCallId, PING_AGENT, recordLlmCall } from "../store/accounting.ts";
 import { hasSecret, secret, setEnv } from "../store/env.ts";
 import type { GatewayDb } from "../store/db.ts";
 import { json, readBody, type Router } from "./router.ts";
@@ -155,23 +157,28 @@ export function registerModels(router: Router, db: GatewayDb): void {
         const name = ctx.param("model");
         const t0 = performance.now();
         const mc = getModel(name, db);
-        let r: ProviderResponse | null = null;
-        let error: string | null = null;
+        const request: Message[] = [{ role: "user", content: "Reply with the single word: pong" }];
+        const timeout = AbortSignal.timeout(15_000);
+        // filled as it streams: a ping that times out keeps what the provider already sent
+        const got: ProviderResponse = { thinking: "", text: "", toolCalls: [], finishReason: "error" };
+        let failed: unknown = null;
         let model: string | null | undefined;
         try {
             const provider = createProvider(name, db);
             model = provider.model ?? null;
-            r = await provider.complete(
-                [{ role: "user", content: "Reply with the single word: pong" }],
-                [],
-                AbortSignal.timeout(15_000),
-            );
+            await provider.complete(request, [], timeout, got);
         } catch (e) {
-            error = (e as Error).message;
+            failed = e;
         }
+        const error = failed === null ? null : (failed as Error).message;
         const ms = Math.round(performance.now() - t0);
         // a model the registry could not even build made no call
         if (model !== undefined) {
+            // as a turn: a ping the provider had but never reported is estimated, never free
+            const estimate =
+                got.usage === undefined && !(failed instanceof NotSentError) && (got.accepted === true || timeout.aborted)
+                    ? estimateUsage(request, [], got.thinking + got.text)
+                    : undefined;
             recordLlmCall(
                 {
                     agent: PING_AGENT,
@@ -182,18 +189,19 @@ export function registerModels(router: Router, db: GatewayDb): void {
                     provider: mc?.provider ?? null,
                     modelUid: mc?.modelUid ?? null,
                     registryModel: name,
-                    reportedModel: r?.model ?? null,
-                    finishReason: r?.finishReason ?? "error",
-                    usage: r?.usage,
+                    reportedModel: got.model ?? null,
+                    finishReason: error === null ? got.finishReason : "error",
+                    usage: got.usage ?? estimate,
+                    usageEstimated: estimate !== undefined,
                     durationMs: ms,
-                    raw: r ? { text: r.text, finishReason: r.finishReason } : { error },
+                    raw: error === null ? { text: got.text, finishReason: got.finishReason } : { error },
                 },
                 db,
             );
         }
-        if (!r) return json(ctx.res, 502, { ok: false, ms, error });
-        if (r.finishReason !== "stop") return json(ctx.res, 502, { ok: false, ms, error: `finish: ${r.finishReason}` });
-        return json(ctx.res, 200, { ok: true, ms, text: r.text.trim().slice(0, 80) });
+        if (error !== null) return json(ctx.res, 502, { ok: false, ms, error });
+        if (got.finishReason !== "stop") return json(ctx.res, 502, { ok: false, ms, error: `finish: ${got.finishReason}` });
+        return json(ctx.res, 200, { ok: true, ms, text: got.text.trim().slice(0, 80) });
     });
 
     router.post("/api/models/:model/key/reveal", (ctx) => {

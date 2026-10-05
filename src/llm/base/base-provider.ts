@@ -3,6 +3,10 @@ import type { Message, Tool } from "@mimi-os/protocol";
 
 import type { ProviderResponse, ProviderStream } from "./base-types.ts";
 
+/** A stop that landed before the request left (every earlier attempt was refused or answered
+ *  429/5xx): no model holds the call, so nothing is spent. */
+export class NotSentError extends Error {}
+
 export abstract class BaseProvider {
     abstract stream(messages: Message[], tools?: Tool[], signal?: AbortSignal): ProviderStream;
 
@@ -10,20 +14,18 @@ export abstract class BaseProvider {
         return undefined;
     }
 
+    /** `result` fills as the stream runs, so a caller that holds it keeps the partial when this throws. */
     async complete(
         messages: Message[],
         tools?: Tool[],
         signal?: AbortSignal,
+        result: ProviderResponse = { thinking: "", text: "", toolCalls: [], finishReason: "error" },
     ): Promise<ProviderResponse> {
-        const result: ProviderResponse = {
-            thinking: "",
-            text: "",
-            toolCalls: [],
-            finishReason: "error",
-        };
-
         for await (const ev of this.stream(messages, tools, signal)) {
             switch (ev.type) {
+                case "accepted":
+                    result.accepted = true;
+                    break;
                 case "thinking":
                     result.thinking += ev.text;
                     break;

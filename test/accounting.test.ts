@@ -8,13 +8,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import type { EventBody, Message } from "@mimi-os/protocol";
+import type { EventBody, Message, Tool } from "@mimi-os/protocol";
 import { runAgent } from "@mimi-os/sdk";
 import { fakeAgentSocket, fakeIdentity, type ScriptedTurn } from "@mimi-os/sdk/testing";
 
 import { addModel, getModel, setDefaultModel, setModelPricing } from "../src/llm/models.ts";
 import { waitingCalls } from "../src/llm/queue.ts";
-import { newCallId, PING_AGENT, recordLlmCall } from "../src/store/accounting.ts";
+import { estimateUsage, newCallId, PING_AGENT, recordLlmCall } from "../src/store/accounting.ts";
 import { dayInfo, dayStart, localDay, setTimeZone, shiftDay, timeZone } from "../src/store/day.ts";
 import { autoTitle } from "../src/turn/autotitle.ts";
 import { summarize } from "../src/turn/compaction.ts";
@@ -77,6 +77,38 @@ async function hangingModel(): Promise<{ url: string; requests: () => number; ab
         },
     };
 }
+
+const delta = (d: Record<string, unknown>, finish: string | null = null): string =>
+    `data: ${JSON.stringify({ choices: [{ index: 0, delta: d, finish_reason: finish }] })}\n\n`;
+
+/** An endpoint that answers request `n` (from 1) by hand: the wire states a scripted turn cannot reach. */
+async function rawModel(answer: (res: ServerResponse, n: number) => void): Promise<{ url: string; requests: () => number; close: () => Promise<void> }> {
+    let requests = 0;
+    const server = createServer((req: IncomingMessage, res: ServerResponse) => {
+        req.resume();
+        req.on("end", () => answer(res, ++requests));
+    });
+    await new Promise<void>((ready) => server.listen(0, "127.0.0.1", ready));
+    return {
+        url: `http://127.0.0.1:${(server.address() as { port: number }).port}`,
+        requests: () => requests,
+        close: async () => {
+            server.closeAllConnections();
+            await new Promise<void>((done) => server.close(() => done()));
+        },
+    };
+}
+
+/** A port nothing listens on: every connection is refused, like a vLLM host that is down. */
+async function closedPort(): Promise<string> {
+    const server = createServer();
+    await new Promise<void>((ready) => server.listen(0, "127.0.0.1", ready));
+    const { port } = server.address() as { port: number };
+    await new Promise<void>((done) => server.close(() => done()));
+    return `http://127.0.0.1:${port}`;
+}
+
+const pause = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 // ── spent: every prompt and every completion, of every call
 
@@ -246,6 +278,211 @@ test("a stopped call is charged an estimate, flagged and rolled up", async () =>
     }
 });
 
+test("a tool call cut off mid-stream is charged the arguments it streamed: a stop, a dropped socket, an agent's own ask", async () => {
+    const env = await boot({ contextTokens: 100_000 });
+    const args = JSON.stringify({ path: "notes.md", content: "y".repeat(8_000) });
+    const streamed = Math.ceil(`write_file${args}`.length / 4);
+    const opened = (res: ServerResponse): void => {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.write(delta({ tool_calls: [{ index: 0, id: "c1", function: { name: "write_file", arguments: args } }] }));
+    };
+    const holding = await rawModel(opened);
+    const dropping = await rawModel((res) => {
+        opened(res);
+        setTimeout(() => res.destroy(), 50);
+    });
+    try {
+        const h = await agentUp(env, "alfa");
+        addModel({ name: "holding", provider: "llamacpp", endpoint: holding.url, contextTokens: 100_000 }, env.db);
+        addModel({ name: "dropping", provider: "llamacpp", endpoint: dropping.url, contextTokens: 100_000 }, env.db);
+
+        setDefaultModel("holding", env.db);
+        const run = env.core.turns.start({ agent: "alfa", session: h.createSession("stop", true), text: "write it", title: false });
+        await waitFor(() => holding.requests() === 1, 4000, "the call to reach the endpoint");
+        await pause(200);
+        run.stop();
+        await run.result;
+
+        setDefaultModel("dropping", env.db);
+        await assert.rejects(env.core.runTurn({ agent: "alfa", session: h.createSession("drop", true), text: "write it", title: false }));
+        h.send({ id: "ask", type: "chat", payload: { messages: [{ role: "user", content: "write it" }], scope: "routine", stream: true } });
+        await waitFor(() => h.frames().some((f) => f["id"] === "ask" && f["type"] !== "stream"), 4000, "the ask to fail");
+
+        const calls = rows(env, "alfa");
+        assert.deepEqual(calls.map((r) => [r.registryModel, r.callKind, r.usageEstimated]), [
+            ["holding", "turn", true],
+            ["dropping", "turn", true],
+            ["dropping", "oneshot", true],
+        ]);
+        for (const r of calls) {
+            assert.ok(r.promptTokens! > 0, "the prompt it was sent counts");
+            assert.equal(r.completionTokens, streamed, `${r.callKind} on ${r.registryModel}: the streamed name and arguments count`);
+            assert.ok(r.firstOutputMs !== null, "the first tool-call delta was output");
+        }
+        const streamedToAgent = h.frames().filter((f) => f["id"] === "ask" && f["type"] === "stream").map((f) => (f["payload"] as { type: string }).type);
+        assert.ok(!streamedToAgent.some((t) => t === "accepted" || t === "tool_args"), "the gateway's own progress events never reach an agent");
+    } finally {
+        await holding.close();
+        await dropping.close();
+        await env.stop();
+    }
+});
+
+test("a tool-call round's first output is its first tool-call delta, not the end of the stream", async () => {
+    const env = await boot({ contextTokens: 100_000 });
+    const slow = await rawModel((res, n) => {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        const usage = `data: ${JSON.stringify({ choices: [], usage: { prompt_tokens: 100, completion_tokens: 10, total_tokens: 110 } })}\n\n`;
+        if (n > 1) {
+            res.end(delta({ content: "done" }) + delta({}, "stop") + usage + "data: [DONE]\n\n");
+            return;
+        }
+        res.write(delta({ tool_calls: [{ index: 0, id: "c1", function: { name: "look", arguments: "{" } }] }));
+        setTimeout(() => res.end(delta({ tool_calls: [{ index: 0, function: { arguments: "}" } }] }) + delta({}, "tool_calls") + usage + "data: [DONE]\n\n"), 500);
+    });
+    try {
+        const h = await agentUp(env, "alfa", true);
+        addModel({ name: "slow", provider: "llamacpp", endpoint: slow.url, contextTokens: 100_000 }, env.db);
+        setDefaultModel("slow", env.db);
+        assert.equal((await env.core.runTurn({ agent: "alfa", session: h.createSession("t", true), text: "look", title: false })).text, "done");
+        const round = rows(env, "alfa")[0]!;
+        assert.ok(round.durationMs! >= 500);
+        assert.ok(round.firstOutputMs! < round.durationMs! - 300, `first output ${round.firstOutputMs}ms of ${round.durationMs}ms`);
+    } finally {
+        await slow.close();
+        await env.stop();
+    }
+});
+
+test("a stop before any provider took the call spends nothing: a refused connection, a 503 while the model loads", async () => {
+    const env = await boot({ contextTokens: 100_000 });
+    const loading = await rawModel((res) => res.writeHead(503).end("Loading model"));
+    try {
+        const h = await agentUp(env, "alfa");
+        addModel({ name: "down", provider: "llamacpp", endpoint: await closedPort(), contextTokens: 100_000 }, env.db);
+        addModel({ name: "loading", provider: "llamacpp", endpoint: loading.url, contextTokens: 100_000 }, env.db);
+        for (const name of ["down", "loading"]) {
+            setDefaultModel(name, env.db);
+            const run = env.core.turns.start({ agent: "alfa", session: h.createSession(name, true), text: "x".repeat(20_000), title: false });
+            // the first attempt failed at once: postSSE now sleeps 1 s before its retry
+            await pause(300);
+            run.stop();
+            await run.result;
+        }
+        assert.equal(loading.requests(), 1, "the only answer was a 503");
+        assert.deepEqual(rows(env, "alfa").map((r) => [r.registryModel, r.usageEstimated, r.promptTokens]), [
+            ["down", false, null],
+            ["loading", false, null],
+        ]);
+        const limits = (await env.api<Array<{ name: string; today: { tokens: number } }>>("GET", "/api/limits")).json;
+        assert.deepEqual(limits.filter((m) => m.name !== "fake").map((m) => [m.name, m.today.tokens]), [
+            ["down", 0],
+            ["loading", 0],
+        ]);
+    } finally {
+        await loading.close();
+        await env.stop();
+    }
+});
+
+test("a call the provider took and lost before any output is estimated: a cut socket, an error chunk", async () => {
+    const env = await boot({ contextTokens: 100_000 });
+    const cut = await rawModel((res) => {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.write(delta({ role: "assistant" }));
+        setTimeout(() => res.destroy(), 50);
+    });
+    const failing = await rawModel((res) => {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.end(`data: ${JSON.stringify({ error: { code: 502, message: "upstream died" }, choices: [{ index: 0, delta: {}, finish_reason: "error" }] })}\n\n`);
+    });
+    try {
+        const h = await agentUp(env, "alfa");
+        addModel({ name: "cut", provider: "llamacpp", endpoint: cut.url, contextTokens: 100_000 }, env.db);
+        addModel({ name: "failing", provider: "llamacpp", endpoint: failing.url, contextTokens: 100_000 }, env.db);
+        for (const name of ["cut", "failing"]) {
+            setDefaultModel(name, env.db);
+            await assert.rejects(env.core.runTurn({ agent: "alfa", session: h.createSession(name, true), text: "x".repeat(20_000), title: false }));
+        }
+        const calls = rows(env, "alfa");
+        assert.deepEqual(calls.map((r) => [r.registryModel, r.usageEstimated, r.completionTokens]), [
+            ["cut", true, 0],
+            ["failing", true, 0],
+        ]);
+        assert.ok(calls.every((r) => r.promptTokens! > 5_000), "the whole prompt it was sent");
+    } finally {
+        await cut.close();
+        await failing.close();
+        await env.stop();
+    }
+});
+
+test("title, compaction and a model check the provider had are estimated when it never reports: no usage chunk, a stop mid-stream", async () => {
+    const env = await boot({ contextTokens: 100_000 });
+    const silent = await rawModel((res) => {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.end(delta({ content: '{"title":"Quiet servers"}' }) + delta({}, "stop") + "data: [DONE]\n\n");
+    });
+    const hanging = await hangingModel();
+    try {
+        const h = await agentUp(env, "toto");
+        const peer = env.core.registry.get("toto")!;
+        addModel({ name: "silent", provider: "llamacpp", endpoint: silent.url, contextTokens: 100_000 }, env.db);
+        addModel({ name: "slow", provider: "llamacpp", endpoint: hanging.url, contextTokens: 100_000 }, env.db);
+        env.db.setModelsPolicy("toto", { allowed: ["fake", "silent", "slow"], primary: "fake" });
+        const lines = ["user: what changed", "assistant: the server stopped sending usage"];
+
+        assert.equal(await autoTitle({ agent: "toto", session: h.createSession(), peer, seed: "why is the server quiet", model: "silent", db: env.db }), true);
+        assert.equal(await summarize({ agent: "toto", session: h.createSession(), cfg: getModel("silent", env.db)!, turnSeq: null }, lines, env.db), '{"title":"Quiet servers"}');
+        assert.equal((await env.api("POST", "/api/models/silent/ping")).status, 200);
+
+        const titleStop = new AbortController();
+        const titled = autoTitle({ agent: "toto", session: h.createSession(), peer, seed: "a slow one", model: "slow", db: env.db, signal: titleStop.signal });
+        await waitFor(() => hanging.requests() === 1, 4000, "the title call to reach the endpoint");
+        titleStop.abort(new Error("chat deleted"));
+        assert.equal(await titled, false);
+        const compactionStop = new AbortController();
+        const summary = summarize({ agent: "toto", session: h.createSession(), cfg: getModel("slow", env.db)!, turnSeq: null, signal: compactionStop.signal }, lines, env.db);
+        await waitFor(() => hanging.requests() === 2, 4000, "the compaction call to reach the endpoint");
+        compactionStop.abort(new Error("stopped by user"));
+        assert.equal(await summary, null);
+
+        const calls = env.db.listLlmCalls(10).reverse();
+        assert.deepEqual(calls.map((r) => [r.callKind, r.registryModel, r.usageEstimated]), [
+            ["title", "silent", true],
+            ["compaction", "silent", true],
+            ["ping", "silent", true],
+            ["title", "slow", true],
+            ["compaction", "slow", true],
+        ]);
+        assert.ok(calls.every((r) => r.promptTokens! > 0), "each prompt it was sent counts");
+        assert.ok(calls.slice(0, 3).every((r) => r.completionTokens! > 0), "and each answer it streamed");
+        const spentOn = (name: string): number =>
+            calls.filter((r) => r.registryModel === name).reduce((n, r) => n + r.promptTokens! + r.completionTokens!, 0);
+        const limits = (await env.api<Array<{ name: string; today: { tokens: number } }>>("GET", "/api/limits")).json;
+        assert.deepEqual(limits.filter((m) => m.name !== "fake").map((m) => [m.name, m.today.tokens]), [
+            ["silent", spentOn("silent")],
+            ["slow", spentOn("slow")],
+        ]);
+    } finally {
+        await silent.close();
+        await hanging.close();
+        await env.stop();
+    }
+});
+
+test("an estimate leaves out only the images a message carries, never a tool parameter of that name", () => {
+    const slides = (key: string): Tool => ({
+        type: "function",
+        function: { name: "make_slides", parameters: { type: "object", properties: { [key]: { type: "array", description: "d".repeat(4_000) } } } },
+    });
+    const ask: Message[] = [{ role: "user", content: "make slides", images: [`data:image/png;base64,${"A".repeat(40_000)}`] }];
+    const named = estimateUsage(ask, [slides("images")], "").promptTokens;
+    assert.equal(named, estimateUsage(ask, [slides("photos")], "").promptTokens);
+    assert.ok(named > 1_000, "the parameter's schema is in the prompt");
+    assert.equal(estimateUsage(ask, [], "").promptTokens, estimateUsage([{ role: "user", content: "make slides" }], [], "").promptTokens);
+});
+
 test("a call stopped while it waits in the queue never reached the provider and spends nothing", async () => {
     const env = await boot({ contextTokens: 100_000 });
     const hanging = await hangingModel();
@@ -270,6 +507,10 @@ test("a call stopped while it waits in the queue never reached the provider and 
         assert.equal(waited?.usageEstimated, false);
         assert.equal(waited?.promptTokens, null);
         assert.equal(hanging.requests(), 1);
+        // the stopped call stays a trace, never a model call: one call on the model's tally, one timing sample
+        assert.deepEqual(env.db.usageMatrix(localDay()).map((r) => [r.registryModel, r.calls]), [["slow", 1]]);
+        const perf = (await env.api<{ modelRows: Array<{ registryModel: string; calls: number; latencyMs: { samples: number } }> }>("GET", "/api/stats/performance?days=1")).json;
+        assert.deepEqual(perf.modelRows.map((r) => [r.registryModel, r.calls, r.latencyMs.samples]), [["slow", 1, 1]]);
     } finally {
         await hanging.close();
         await env.stop();
@@ -551,6 +792,54 @@ test("MIMI_TZ sets the day every bucket and limit uses; DST days are 23 and 25 h
         assert.deepEqual(env.db.usageSeries(shiftDay(localDay(), -1)).map((r) => r.day), [localDay()]);
         assert.deepEqual(env.db.modelTokens().get(uid), { promptTokens: 7, completionTokens: 5 });
         assert.equal(env.db.modelTokens(shiftDay(localDay(), -1)).size, 0);
+    } finally {
+        await env.stop();
+    }
+});
+
+test("a day whose local midnight a DST switch skips starts at the switch, not an hour before it", (t) => {
+    const host = timeZone();
+    t.after(() => setTimeZone(host));
+    setTimeZone("America/Santiago");
+    // Sep 6, 2026: 00:00 at -04 is already 01:00 at -03
+    assert.equal(new Date(dayStart("2026-09-06")).toISOString(), "2026-09-06T04:00:00.000Z");
+    assert.equal(dayInfo(Date.parse("2026-09-05T15:00:00Z")).resetsAt, "2026-09-06T04:00:00.000Z");
+    setTimeZone("America/Havana");
+    assert.equal(new Date(dayStart("2026-03-08")).toISOString(), "2026-03-08T05:00:00.000Z");
+    // every day of the year, in zones that switch at midnight, at another hour, by half an hour, or never
+    for (const zone of ["America/Santiago", "America/Havana", "Europe/Helsinki", "Australia/Lord_Howe", "Asia/Kolkata"]) {
+        setTimeZone(zone);
+        for (let day = "2026-01-01"; day <= "2026-12-31"; day = shiftDay(day, 1)) {
+            const at = dayStart(day);
+            assert.deepEqual([localDay(at), localDay(at - 1000)], [day, shiftDay(day, -1)], `${zone} ${day}`);
+        }
+    }
+});
+
+test("the dashboard's today is every agent's spend, a revoked agent's too, and never a model check", async () => {
+    const env = await boot();
+    try {
+        const uid = getModel("fake", env.db)!.modelUid;
+        setModelPricing("fake", { priceInPerM: 2, priceOutPerM: 6 }, env.db);
+        const spend = (agent: string, prompt: number, completion: number): void =>
+            recordLlmCall(
+                { agent, scope: agent, callId: newCallId(), callKind: "turn", modelUid: uid, registryModel: "fake", usage: { promptTokens: prompt, completionTokens: completion, totalTokens: prompt + completion, cachedTokens: 0 }, raw: {} },
+                env.db,
+            );
+        env.pin("alfa");
+        env.pin("beta");
+        spend("alfa", 50_000, 5_000);
+        spend("beta", 1_000, 100);
+        spend(PING_AGENT, 12, 1);
+        type Dash = { today: { tokens: number; cost: number }; agents: Array<{ name: string }> };
+        const before = (await env.api<Dash>("GET", "/api/dashboard")).json;
+        const cost = (51_000 * 2 + 5_100 * 6) / 1e6;
+        assert.deepEqual(before.today, { tokens: 56_100, cost });
+
+        assert.equal((await env.api("DELETE", "/api/pins/alfa")).status, 200);
+        const after = (await env.api<Dash>("GET", "/api/dashboard")).json;
+        assert.equal(after.agents.some((a) => a.name === "alfa"), false, "the roster is who is pinned now");
+        assert.deepEqual(after.today, { tokens: 56_100, cost }, "what alfa spent today stays spent");
     } finally {
         await env.stop();
     }

@@ -38,6 +38,9 @@ export interface LlmCallRecord {
     usage?: Usage | undefined;
     /** `usage` is estimateUsage()'s guess, not the provider's report. */
     usageEstimated?: boolean | undefined;
+    /** false: the call never left the gateway (stopped or refused in the queue, no provider built) —
+     *  a trace row, never a model call. */
+    dispatched?: boolean | undefined;
     durationMs?: number;
     /** Queue included: call start to the first nonempty output event; null when never measured. */
     firstOutputMs?: number | null;
@@ -55,9 +58,9 @@ export function setUsageRecordedHook(db: GatewayDb, fn: ((agent: string) => void
 }
 
 /** chars/4 of what was sent (images left out) and of what streamed back, for a call the provider
- *  had but never reported: stopped, or failed mid-stream. */
+ *  had but never reported: stopped, failed, or a server that sends no usage. */
 export function estimateUsage(messages: readonly Message[], tools: readonly Tool[], output: string): Usage {
-    const sent = JSON.stringify({ messages, tools }, (key, value: unknown) => (key === "images" ? undefined : value));
+    const sent = JSON.stringify({ messages: messages.map(({ images: _images, ...m }) => m), tools });
     const promptTokens = Math.ceil(sent.length / CHARS_PER_TOKEN);
     const completionTokens = Math.ceil(output.length / CHARS_PER_TOKEN);
     return { promptTokens, completionTokens, totalTokens: promptTokens + completionTokens, cachedTokens: 0 };
@@ -72,15 +75,17 @@ export function recordLlmCall(
 ): void {
     const u = record.usage;
     try {
-        db.bumpUsageDaily(day, {
-            agent: record.agent,
-            model: record.model ?? "",
-            modelUid: record.modelUid ?? null,
-            registryModel: record.registryModel ?? null,
-            promptTokens: u?.promptTokens ?? 0,
-            completionTokens: u?.completionTokens ?? 0,
-            estimated: record.usageEstimated === true,
-        });
+        if (record.dispatched !== false) {
+            db.bumpUsageDaily(day, {
+                agent: record.agent,
+                model: record.model ?? "",
+                modelUid: record.modelUid ?? null,
+                registryModel: record.registryModel ?? null,
+                promptTokens: u?.promptTokens ?? 0,
+                completionTokens: u?.completionTokens ?? 0,
+                estimated: record.usageEstimated === true,
+            });
+        }
     } catch (error) {
         process.stderr.write(`[accounting] ${record.agent} call ${record.callId}: usage write failed — ${String(error)}\n`);
     }
@@ -95,7 +100,7 @@ export function recordLlmCall(
             callId: record.callId,
             callKind: record.callKind,
             model: record.model ?? null,
-            provider: record.provider ?? null,
+            provider: record.dispatched === false ? null : (record.provider ?? null),
             modelUid: record.modelUid ?? null,
             registryModel: record.registryModel ?? null,
             reportedModel: record.reportedModel ?? null,

@@ -12,7 +12,8 @@ import type { StreamEvent } from "@mimi-os/protocol";
 import { checkEnv, secret, setEnv, unsetEnv } from "../src/store/env.ts";
 import { gatewayDb } from "../src/store/db.ts";
 import * as models from "../src/llm/models.ts";
-import type { ProviderDone, ProviderEvent } from "../src/llm/base/base-types.ts";
+import { NotSentError } from "../src/llm/base/index.ts";
+import type { ProviderDone, ProviderEvent, ProviderResponse } from "../src/llm/base/base-types.ts";
 import { LlamaProvider } from "../src/llm/providers/llama-cpp/index.ts";
 import { OpenRouterProvider } from "../src/llm/providers/openrouter/index.ts";
 import { parseSSE, postSSE, toWireMessages } from "../src/llm/providers/shared/openai-sse.ts";
@@ -97,12 +98,13 @@ const doneOf = (events: ProviderEvent[]): ProviderDone | undefined => {
 };
 
 /** Drops the always-present provider extras (llama-only timings, the served model) — both ride `done` as
- *  plain keys whose value is undefined when unreported, and each has its own test below. */
+ *  plain keys whose value is undefined when unreported — and the gateway-only progress events; each has its own test below. */
 function withoutExtras(events: ProviderEvent[]): StreamEvent[] {
-    return events.map((e) => {
-        if (e.type !== "done") return e;
+    return events.flatMap((e) => {
+        if (e.type === "accepted" || e.type === "tool_args") return [];
+        if (e.type !== "done") return [e];
         const { meta: _meta, model: _model, ...rest } = e;
-        return rest as StreamEvent;
+        return [rest as StreamEvent];
     });
 }
 
@@ -147,6 +149,61 @@ test("llama.cpp and openrouter SSE dialects normalize to identical StreamEvent s
     const orDone = orEvents.at(-1);
     assert.ok(llamaDone && llamaDone.type === "done" && llamaDone.meta !== undefined);
     assert.ok(orDone && orDone.type === "done" && orDone.meta === undefined);
+});
+
+test("the gateway's own progress: `accepted` opens every stream, and a tool call's text streams as it arrives", async () => {
+    const events = await withStubbedFetch(LLAMA_SSE, () =>
+        collect(new LlamaProvider({ endpointUrl: "http://x", model: "m" }).stream([{ role: "user", content: "hi" }])),
+    );
+    assert.deepEqual(events[0], { type: "accepted" });
+    assert.deepEqual(
+        events.filter((e) => e.type === "tool_args" || e.type === "tool_calls").map((e) => e.type === "tool_args" ? e.text : e.type),
+        ['get_time{"a":', "1}", "tool_calls"],
+        "every delta's name and argument text, before the assembled call",
+    );
+    // complete() fills the caller's own object, so a stream that throws leaves its partial there
+    const body = sse([
+        JSON.stringify({ choices: [{ delta: { reasoning: "weighing it" }, finish_reason: null }] }),
+        JSON.stringify({ error: { code: 502, message: "Provider disconnected" } }),
+    ]);
+    const held: ProviderResponse = { thinking: "", text: "", toolCalls: [], finishReason: "error" };
+    const provider = new OpenRouterProvider({ endpointUrl: "http://x", model: "m", apiKey: "k" });
+    await assert.rejects(withStubbedFetch(body, () => provider.complete([{ role: "user", content: "hi" }], [], undefined, held)), /Provider disconnected/);
+    assert.deepEqual([held.accepted, held.thinking, held.usage], [true, "weighing it", undefined]);
+});
+
+test("a stop before the request leaves is NotSentError; a stop on a request in flight is not", async (t) => {
+    const original = globalThis.fetch;
+    t.after(() => (globalThis.fetch = original));
+    // refused at once: what a down vLLM does, so postSSE sleeps before its retry
+    let fetches = 0;
+    globalThis.fetch = (() => {
+        fetches++;
+        return Promise.reject(new Error("fetch failed"));
+    }) as typeof fetch;
+    const stop = new AbortController();
+    const refused = postSSE({ url: "http://x", headers: {}, body: {}, label: "vllm", retryDelayMs: 5_000, signal: stop.signal });
+    await settle();
+    stop.abort(new Error("stopped by user"));
+    const notSent = await refused.catch((e: unknown) => e);
+    assert.ok(notSent instanceof NotSentError, String(notSent));
+    assert.match(notSent.message, /^vllm: stopped before the request was sent$/);
+    assert.equal(fetches, 1);
+    const already = AbortSignal.abort(new Error("stopped by user"));
+    await assert.rejects(postSSE({ url: "http://x", headers: {}, body: {}, label: "vllm", signal: already }), NotSentError);
+
+    // the request is out and the endpoint has it: the stop is the stop, and the call may have spent
+    globalThis.fetch = ((_url: string, init: RequestInit) =>
+        new Promise((_resolve, reject) => {
+            init.signal?.addEventListener("abort", () => reject(init.signal?.reason));
+        })) as unknown as typeof fetch;
+    const inFlight = new AbortController();
+    const held = postSSE({ url: "http://x", headers: {}, body: {}, label: "vllm", signal: inFlight.signal });
+    await settle();
+    inFlight.abort(new Error("stopped by user"));
+    const stopped = await held.catch((e: unknown) => e);
+    assert.ok(!(stopped instanceof NotSentError));
+    assert.match(String(stopped), /stopped by user/);
 });
 
 test("the model an endpoint names in its own chunks rides `done`; a silent dialect names none", async () => {

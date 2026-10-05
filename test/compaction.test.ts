@@ -156,6 +156,11 @@ test("a summarize whose provider cannot be built any more is accounted and skipp
             ],
         );
         assert.equal(keyed.requests.length, 2, "only the turn's two rounds reached the model");
+        assert.deepEqual(
+            env.db.usageMatrix("").map((r) => [r.model, r.calls]),
+            [["m", 2]],
+            "a provider never built leaves trace rows, never a model call",
+        );
     } finally {
         if (sharedKey === undefined) delete process.env["OPENROUTER_API_KEY"];
         else process.env["OPENROUTER_API_KEY"] = sharedKey;

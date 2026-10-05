@@ -6,7 +6,7 @@ import test from "node:test";
 
 import type { Usage } from "@mimi-os/protocol";
 
-import { getModel, setModelPricing } from "../src/llm/models.ts";
+import { addModel, getModel, patchModel, removeModel, setModelPricing } from "../src/llm/models.ts";
 import { newCallId, recordLlmCall } from "../src/store/accounting.ts";
 import { localDay, shiftDay } from "../src/store/day.ts";
 import { LLM_CALLS_KEEP, type GatewayDb } from "../src/store/db.ts";
@@ -418,6 +418,31 @@ test("a rename keeps one bucket: the uid is the key, the alias is only what it w
         // recreation is a different model: a fresh uid opens a bucket of its own
         call(env.db, now, "alfa", "openai/gpt-2", 5, 0, { uid: "uid-fresh", alias: "quick" });
         assert.equal(env.db.usageByRegistry(before).length, 2);
+    } finally {
+        await env.stop();
+    }
+});
+
+test("a model still in the registry reads as its name now: a rename shows at once, even when a new model takes the old name", async () => {
+    const env = await boot();
+    try {
+        addModel({ name: "fast", provider: "llamacpp", endpoint: "http://127.0.0.1:9", contextTokens: 1000 }, env.db);
+        const uid = getModel("fast", env.db)!.modelUid;
+        recordLlmCall(
+            { agent: "alfa", scope: "alfa", callId: newCallId(), callKind: "turn", model: "qwen3-8b", provider: "llamacpp", modelUid: uid, registryModel: "fast", usage: usage(900_000, 10_000), durationMs: 1_000, raw: { ok: 1 } },
+            env.db,
+        );
+        patchModel("fast", { name: "fast-old" }, env.db);
+        addModel({ name: "fast", provider: "llamacpp", endpoint: "http://127.0.0.1:10", contextTokens: 1000 }, env.db);
+
+        const grouped = (await env.api<UsageBody>("GET", "/api/stats/usage?days=1&group=registry")).json;
+        assert.deepEqual(grouped.registryRows?.map((r) => [r.modelUid, r.registryModel, r.totalTokens]), [[uid, "fast-old", 910_000]]);
+        const perf = (await env.api<{ modelRows: Array<{ modelUid: string | null; registryModel: string | null }> }>("GET", "/api/stats/performance?days=1")).json;
+        assert.deepEqual(perf.modelRows.map((r) => [r.modelUid, r.registryModel]), [[uid, "fast-old"]]);
+
+        // gone from the registry: the alias its calls last recorded is all that is left
+        removeModel("fast-old", env.db);
+        assert.equal(env.db.usageByRegistry(localDay())[0]?.registryModel, "fast");
     } finally {
         await env.stop();
     }

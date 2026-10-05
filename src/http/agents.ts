@@ -1,6 +1,7 @@
 import type { GatewayCore } from "../core.ts";
 import { defaultModelName, resolveModelFor } from "../llm/policy.ts";
 import type { AgentInfo } from "../registry/registry-types.ts";
+import { PING_AGENT } from "../store/accounting.ts";
 import type { LlmCallRow, ModelsPolicy } from "../store/db.ts";
 import { dayInfo } from "../store/day.ts";
 import { gatewayToolNames } from "../turn/gateway-tools.ts";
@@ -92,9 +93,17 @@ export function registerAgents(router: Router, core: GatewayCore): void {
     router.get("/api/dashboard", (ctx) => {
         const approvals = core.approvals.pending();
         const spend = core.db.spendByAgent();
+        // every agent's spend, a revoked one's too: the roster below is only who is pinned now
+        const today = { tokens: 0, cost: 0 };
+        for (const [agent, s] of spend) {
+            if (agent === PING_AGENT) continue;
+            today.tokens += s.tokens;
+            today.cost += s.cost;
+        }
         return json(ctx.res, 200, {
             at: isoStamp(Date.now()),
             day: dayInfo(),
+            today,
             waiting: { approvals: approvals.length },
             agents: core.listAgents().map((a) => dashboardRow(a, spend.get(a.name))),
             // as /api/approvals: a chat gate names its conversation, a room gate its room, never both

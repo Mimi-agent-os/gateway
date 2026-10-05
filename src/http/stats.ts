@@ -167,7 +167,7 @@ export function registerStats(router: Router, db: GatewayDb): void {
                 };
                 byModel.set(key, m);
             }
-            // rows arrive oldest first, so a rename reads as the LAST alias the group recorded
+            // rows arrive oldest first, so a model gone from the registry reads as the LAST alias the group recorded
             if (r.registryModel !== null) m.identity.registryModel = r.registryModel;
             fold(m.b, r);
             let provider = byProvider.get(r.provider);
@@ -177,6 +177,9 @@ export function registerStats(router: Router, db: GatewayDb): void {
             }
             fold(provider, r);
         }
+
+        // a model still in the registry reads as its name now, whatever alias its calls recorded
+        const names = new Map(db.listModels().map((m) => [m.modelUid, m.name]));
 
         // nothing recorded claims nothing; otherwise the rows must reach PAST the window and be timed throughout
         const coverage = db.callCoverage(sinceStamp);
@@ -193,7 +196,7 @@ export function registerStats(router: Router, db: GatewayDb): void {
             },
             totals: aggregate(totals),
             modelRows: [...byModel.values()]
-                .map((m) => ({ ...m.identity, ...aggregate(m.b) }))
+                .map((m) => ({ ...m.identity, registryModel: names.get(m.identity.modelUid ?? "") ?? m.identity.registryModel, ...aggregate(m.b) }))
                 .sort((a, b) => b.calls - a.calls || (a.model ?? "").localeCompare(b.model ?? "")),
             providerRows: [...byProvider]
                 .map(([provider, totals]) => ({ provider, ...aggregate(totals) }))

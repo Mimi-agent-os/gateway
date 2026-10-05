@@ -60,6 +60,8 @@ export function dayStart(day: string): number {
     let at = midnight;
     // twice: the first guess may sit on the other side of a DST switch
     for (let i = 0; i < 2; i++) at = midnight - (wallMs(at) - at);
+    // a switch that skips local midnight (Santiago, Havana) leaves the guess in the day before: step over the gap
+    if (localDay(at) !== day) at += wallMs(at + DAY_MS / 2) - (at + DAY_MS / 2) - (wallMs(at) - at);
     return at;
 }
 

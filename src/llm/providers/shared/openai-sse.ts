@@ -2,7 +2,7 @@
 import { isImageDataUri } from "@mimi-os/protocol";
 import type { FinishReason, Message, ToolCall, Usage } from "@mimi-os/protocol";
 
-import type { ProviderStream } from "../../base/index.ts";
+import { NotSentError, type ProviderStream } from "../../base/index.ts";
 
 interface WireDelta {
     content?: string;
@@ -109,8 +109,12 @@ export async function postSSE(opts: PostSSEOptions): Promise<Response> {
     let lastError: unknown = new Error(`${opts.label}: request failed`);
 
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
-        if (attempt > 0) await sleep(baseDelay * attempt, opts.signal);
-        opts.signal?.throwIfAborted(); // an external abort is never retried
+        try {
+            if (attempt > 0) await sleep(baseDelay * attempt, opts.signal);
+            opts.signal?.throwIfAborted(); // an external abort is never retried
+        } catch (e) {
+            throw new NotSentError(`${opts.label}: stopped before the request was sent`, { cause: e });
+        }
 
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -213,7 +217,8 @@ export async function* parseSSE<T extends WireChunk = WireChunk>(
     }
 }
 
-/** Chunks → provider events: tool-call deltas merge by index, and `done` always closes the stream. */
+/** Chunks → provider events: `accepted` opens, tool-call deltas merge by index (their text also
+ *  streams as `tool_args`), and `done` always closes the stream. */
 export async function* readChatStream<T extends WireChunk>(
     response: Response,
     label: string,
@@ -226,6 +231,7 @@ export async function* readChatStream<T extends WireChunk>(
     let meta: unknown;
     let model: string | undefined;
 
+    yield { type: "accepted" };
     for await (const chunk of parseSSE<T>(response, label)) {
         if (chunk.error) {
             const detail = typeof chunk.error === "string" ? chunk.error : (chunk.error.message ?? JSON.stringify(chunk.error));
@@ -249,6 +255,8 @@ export async function* readChatStream<T extends WireChunk>(
             acc.id += tc.id ?? "";
             acc.name += tc.function?.name ?? "";
             acc.arguments += tc.function?.arguments ?? "";
+            const piece = (tc.function?.name ?? "") + (tc.function?.arguments ?? "");
+            if (piece) yield { type: "tool_args", text: piece };
         }
         if (choice.finish_reason) finishReason = normalizeFinish(choice.finish_reason);
     }
