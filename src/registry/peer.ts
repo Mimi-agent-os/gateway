@@ -79,7 +79,7 @@ export class AgentPeer {
     private readonly pending = new Map<string, Pending>();
     /** Epoch ms each deadlined request told the agent to finish by, kept until that moment even if
      *  the waiter here is gone: a turn Stop frees the gateway, the agent's own expire timer ends it. */
-    private readonly deadlines = new Map<string, number>();
+    private readonly deadlines = new Map<string, { at: number; type: RequestType }>();
 
     constructor(
         socket: AgentSocket,
@@ -107,12 +107,13 @@ export class AgentPeer {
         return this.socket.open && this.stage === "ready";
     }
 
-    /** The earliest deadline this peer is still being held to. An approval it asks for while
-     *  serving that request cannot outlive it: the SDK stops listening when the deadline passes. */
-    get deadlineAt(): number | undefined {
+    /** The earliest deadline this peer is still being held to, of one request type or any. An approval
+     *  it asks for while serving that request cannot outlive it: the SDK stops listening when it passes. */
+    deadlineAt(only?: RequestType): number | undefined {
         const now = Date.now();
         let earliest: number | undefined;
-        for (const at of this.deadlines.values()) {
+        for (const { at, type } of this.deadlines.values()) {
+            if (only !== undefined && type !== only) continue;
             if (at > now && (earliest === undefined || at < earliest)) earliest = at;
         }
         return earliest;
@@ -130,8 +131,8 @@ export class AgentPeer {
         const id = randomUUID();
         if (opts?.deadline !== undefined) {
             const now = Date.now();
-            for (const [key, at] of this.deadlines) if (at <= now) this.deadlines.delete(key);
-            this.deadlines.set(id, now + opts.deadline);
+            for (const [key, { at }] of this.deadlines) if (at <= now) this.deadlines.delete(key);
+            this.deadlines.set(id, { at: now + opts.deadline, type });
         }
         // `??` would read an explicit null (no timer) as unset
         const timeoutMs =

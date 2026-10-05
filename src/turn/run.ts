@@ -4,6 +4,13 @@ export type CompleteTurn = (outcome: TurnOutcome, signal: AbortSignal) => Record
 
 type Emit = (event: Record<string, unknown>) => void;
 
+/** A stop nobody asked for: the agent's socket closed or was replaced while the turn ran. */
+export class AgentGone extends Error {
+    constructor() {
+        super("the agent disconnected");
+    }
+}
+
 export class TurnRun {
     readonly agent: string;
     readonly session: number | null;
@@ -15,7 +22,10 @@ export class TurnRun {
     private readonly abort = new AbortController();
     private readonly observer: Emit | undefined;
     private log: Record<string, unknown>[] | null = [];
-    private sink: Emit | null = null;
+    /** Every page on this chat: two devices on one turn both get each gate. */
+    private readonly sinks = new Set<Emit>();
+    /** Tool calls running now: an ask that names no chat can only be this turn's while one is. */
+    private readonly calling = new Set<unknown>();
 
     constructor(
         request: TurnRequest,
@@ -33,13 +43,17 @@ export class TurnRun {
         this.result = Promise.resolve().then(() => execute(this.signal, this.emit)).finally(() => {
             this.signal.removeEventListener("abort", cancelGates);
             this.log = null;
-            this.sink = null;
+            this.sinks.clear();
         });
         this.finished = this.result.then(() => undefined, () => undefined);
     }
 
-    stop(): void {
-        this.abort.abort(new Error("stopped by user"));
+    stop(why: "owner" | "gone" = "owner"): void {
+        this.abort.abort(why === "gone" ? new AgentGone() : new Error("stopped by user"));
+    }
+
+    get inTool(): boolean {
+        return this.calling.size > 0;
     }
 
     get activeTurnSeq(): number | undefined {
@@ -49,15 +63,17 @@ export class TurnRun {
 
     attach(send: Emit): () => void {
         for (const event of this.log ?? []) send(event);
-        this.sink = send;
+        if (this.log !== null) this.sinks.add(send);
         return () => {
-            if (this.sink === send) this.sink = null;
+            this.sinks.delete(send);
         };
     }
 
     readonly emit: Emit = (event) => {
         if (this.log === null) return;
         const type = event["type"];
+        if (type === "tool_call") this.calling.add(event["id"]);
+        else if (type === "tool_result") this.calling.delete(event["id"]);
         const previous = this.log.at(-1);
         // Provider chunk boundaries do not matter to reconnect replay.
         if ((type === "text" || type === "thinking") && previous?.["type"] === type &&
@@ -67,6 +83,6 @@ export class TurnRun {
             this.log.push({ ...event });
         }
         this.observer?.(event);
-        this.sink?.(event);
+        for (const send of this.sinks) send(event);
     };
 }

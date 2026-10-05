@@ -611,6 +611,34 @@ test("approvals: a denied gate fans out as denied, and two gates never share an 
     }
 });
 
+test("approvals: every device hears a batch gate by its id and its call count, not as one call", async () => {
+    const env = await boot({ contextTokens: 4000 });
+    try {
+        await connected(env, {
+            name: "toto",
+            tools: [{ name: "add_event", writes: true, parameters: { type: "object", properties: {} } }],
+            handlers: { add_event: { text: "ADDED" } },
+        });
+        const events = await env.stream("GET", "/api/events");
+        await waitFor(() => events.lines.some((e) => e["type"] === "ready"), 4000, "the stream opened");
+        const id = await conversation(env);
+        env.model.nextTurn(callTurn(["a", "b", "c", "d"].map((call) => ({ id: call, name: "add_event" }))));
+        env.model.nextTurn(textTurn("added"));
+        const turn = await env.stream("POST", `/api/agents/toto/conversations/${id}/messages`, { text: "add four" });
+        await waitFor(() => events.lines.some((e) => e["type"] === "approval"), 4000, "the announcement");
+
+        const gate = env.core.approvals.pending()[0]!.gate;
+        const { type, ...announced } = events.lines.find((e) => e["type"] === "approval")!;
+        assert.equal(type, "approval");
+        assert.deepEqual(announced, { kind: "approval", agent: "toto", session: id, gate, tool: "add_event", actions: 4 });
+        env.core.approvals.answer(gate, {});
+        await turn.done;
+        events.close();
+    } finally {
+        await env.stop();
+    }
+});
+
 test("dashboard: a waiting approval names its conversation, and a chat-less one names none rather than 0", async () => {
     const env = await boot({ contextTokens: 4000 });
     try {

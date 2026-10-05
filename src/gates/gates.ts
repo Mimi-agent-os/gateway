@@ -24,12 +24,22 @@ interface GateParked {
     session: SessionId | null;
     room: string | null;
     tool: string;
+    /** How many calls the gate holds; 0 on a question. */
+    actions: number;
 }
 
 interface GateResolved {
     gate: string;
+    kind: GateKind;
     agent: string;
     session: SessionId | null;
+    actions: number;
+    outcome: GateOutcome;
+}
+
+/** An approval's per-call decisions and how the gate ended, so an expiry never reads as a Deny. */
+export interface GateVerdict {
+    decisions: Record<string, boolean>;
     outcome: GateOutcome;
 }
 
@@ -39,7 +49,7 @@ interface GateClosed {
 }
 
 /** An unanswered gate denies EVERY action after five minutes. */
-const APPROVAL_TIMEOUT_MS = 5 * 60_000;
+export const APPROVAL_TIMEOUT_MS = 5 * 60_000;
 /** A question holds its turn this long before the agent hears that nobody answered. */
 const QUESTION_TIMEOUT_MS = 12 * 60 * 60_000;
 
@@ -49,17 +59,20 @@ export class Gates {
     private readonly onPark: (ev: GateParked) => void;
     private readonly onResolve: (ev: GateResolved) => void;
     private readonly questionMs: number;
+    private readonly approvalMs: number;
 
     constructor(opts?: {
         log?: (msg: string) => void;
         onPark?: (ev: GateParked) => void;
         onResolve?: (ev: GateResolved) => void;
         questionTimeoutMs?: number | undefined;
+        approvalTimeoutMs?: number | undefined;
     }) {
         this.log = opts?.log ?? ((): void => undefined);
         this.onPark = opts?.onPark ?? ((): void => undefined);
         this.onResolve = opts?.onResolve ?? ((): void => undefined);
         this.questionMs = opts?.questionTimeoutMs ?? QUESTION_TIMEOUT_MS;
+        this.approvalMs = opts?.approvalTimeoutMs ?? APPROVAL_TIMEOUT_MS;
     }
 
     private writeLog(message: string): void {
@@ -104,7 +117,7 @@ export class Gates {
             const { outcome, event } = close(id, reply, ending);
             this.notify(`${id} resolution`, () => ctx.emit?.(event));
             this.notify(`${id} resolution`, () =>
-                this.onResolve({ gate: id, agent: ctx.agent, session: ctx.session, outcome }),
+                this.onResolve({ gate: id, kind: body.kind, agent: ctx.agent, session: ctx.session, actions: body.actions.length, outcome }),
             );
         };
         const timer = setTimeout(() => {
@@ -128,10 +141,10 @@ export class Gates {
                     : { type: "question_required", gate: id, questions: body.questions, deadline },
             ),
         );
-        // the chat sink reaches one page; this reaches every device that is listening
+        // the chat stream reaches the pages on this chat; this reaches every device that is listening
         const tool = body.kind === "approval" ? (body.actions[0]?.tool ?? "") : ASK_OWNER;
         this.notify(`${id} park`, () =>
-            this.onPark({ gate: id, kind: body.kind, agent: ctx.agent, session: ctx.session, room, tool }),
+            this.onPark({ gate: id, kind: body.kind, agent: ctx.agent, session: ctx.session, room, tool, actions: body.actions.length }),
         );
     }
 
@@ -140,7 +153,7 @@ export class Gates {
         ctx: GateContext,
         actions: readonly GateAction[],
         onPark?: (gate: string) => void,
-    ): Promise<Record<string, boolean>> {
+    ): Promise<GateVerdict> {
         // an action name is agent-chosen text and lands in gateway.log, which an owner reads in
         // a terminal: no ESC, CR or LF may travel with it
         const tools = actions.map((a) => a.tool.replace(/[\p{Cc}\p{Cf}]/gu, " ")).join(", ");
@@ -149,27 +162,24 @@ export class Gates {
                 const decisions = reply !== null && "decisions" in reply ? reply.decisions : {};
                 const out: Record<string, boolean> = {};
                 for (const a of actions) out[a.id] = decisions[a.id] === true;
-                resolve(out);
                 const allowed = Object.values(out).some((v) => v);
-                return {
-                    outcome: ending !== "answered" ? ending : allowed ? "approved" : "denied",
-                    event: { type: "approval_resolved", gate: id, decisions: out },
-                };
+                const outcome: GateOutcome = ending !== "answered" ? ending : allowed ? "approved" : "denied";
+                resolve({ decisions: out, outcome });
+                return { outcome, event: { type: "approval_resolved", gate: id, outcome, decisions: out } };
             };
             const body = { kind: "approval" as const, actions: [...actions], questions: [] };
-            this.park(ctx, body, APPROVAL_TIMEOUT_MS, `denied: ${tools}`, close, onPark);
+            this.park(ctx, body, this.approvalMs, `denied: ${tools}`, close, onPark);
         });
     }
 
-    /** The nested gate — a single question asked from inside a running tool (RETURN gates). */
+    /** The nested gate — a single question asked from inside a running tool (RETURN gates); "approved" only on the owner's yes. */
     async askOne(
         ctx: GateContext,
         label: string,
         detail?: Record<string, unknown>,
         onPark?: (gate: string) => void,
-    ): Promise<boolean> {
-        const answers = await this.ask(ctx, [{ id: "a1", tool: label, args: detail ?? {} }], onPark);
-        return answers["a1"] === true;
+    ): Promise<GateOutcome> {
+        return (await this.ask(ctx, [{ id: "a1", tool: label, args: detail ?? {} }], onPark)).outcome;
     }
 
     /** ask_owner's gate: the owner's answers, or null once they dismissed it or it expired or went away. */

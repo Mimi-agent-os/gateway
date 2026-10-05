@@ -287,7 +287,7 @@ function askTool(target: string, ctx: GatewayToolCtx): RuntimeTool {
             advanceInteraction(ctx.deps, record.id, { status: "answered" });
             const data = { interactionId: record.id, conversation };
             // THE RETURN GATE — text derived from outside is about to enter this prompt
-            const ok =
+            const outcome =
                 ctx.req.attended === true
                     ? await ctx.deps.gates.askOne(
                           ctx.gateCtx,
@@ -295,8 +295,8 @@ function askTool(target: string, ctx: GatewayToolCtx): RuntimeTool {
                           { task, report },
                           (gate) => advanceInteraction(ctx.deps, record.id, { gate }),
                       )
-                    : false;
-            if (!ok) {
+                    : "denied";
+            if (outcome !== "approved") {
                 return {
                     text:
                         `The user did NOT let the report from "${target}" into this ` +

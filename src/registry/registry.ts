@@ -283,8 +283,8 @@ function validateDescribe(
 export class Registry {
     hooks: PeerHooks | null = null;
     /** Everything this agent has in flight must end: its socket is gone (disconnected, replaced by a
-     *  reconnect, blocked, revoked) or the owner paused it. Core stops its turns, gates and one-shot calls. */
-    onStopped: ((name: string) => void) | null = null;
+     *  reconnect) or the owner blocked, revoked or paused it. Core stops its turns, gates and one-shot calls. */
+    onStopped: ((name: string, why: "owner" | "gone") => void) | null = null;
     readonly admission: Admissions;
 
     private readonly opts: RegistryOptions;
@@ -372,7 +372,7 @@ export class Registry {
     /** Gateway-side only: the agent is never told, because the gate that enforces it is here. */
     setPaused(name: string, paused: boolean): void {
         this.db.setPaused(name, paused);
-        if (paused) this.onStopped?.(name);
+        if (paused) this.onStopped?.(name, "owner");
         this.events.emit({ type: "agent_changed", name });
     }
 
@@ -539,7 +539,7 @@ export class Registry {
             old.close(1000, "replaced by a newer connection");
             // the old socket's forget() sees the map entry already gone, so it is silent — this is
             // where the work that socket parked is settled, before the successor is registered
-            this.onStopped?.(peer.name);
+            this.onStopped?.(peer.name, "gone");
             this.log(`[registry] ${peer.name}: reconnected — the previous socket was closed\n`);
         }
         this.peers.set(peer.name, peer);
@@ -604,7 +604,7 @@ export class Registry {
 
     private disconnect(name: string, code: number, reason: string): void {
         // an offline agent can still hold a parked gate or a queued model call, so this comes first
-        this.onStopped?.(name);
+        this.onStopped?.(name, "owner");
         const peer = this.peers.get(name);
         if (!peer) return;
         this.peers.delete(name);
@@ -622,7 +622,7 @@ export class Registry {
         }
         this.peers.delete(peer.name);
         this.health.delete(peer.name);
-        this.onStopped?.(peer.name);
+        this.onStopped?.(peer.name, "gone");
         this.log(`[registry] ${peer.name}: disconnected\n`);
         this.events.emit({ type: "agent_changed", name: peer.name });
     }

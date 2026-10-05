@@ -10,7 +10,7 @@ import test from "node:test";
 import type { NotifyTarget } from "@mimi-os/protocol";
 
 import { GatewayDb } from "../src/store/db.ts";
-import { boot, waitFor } from "./harness-env.ts";
+import { boot, callTurn, textTurn, waitFor } from "./harness-env.ts";
 
 function freshDb(): { db: GatewayDb; cleanup: () => void } {
     const dir = mkdtempSync(join(tmpdir(), "mimi-inbox-"));
@@ -231,4 +231,35 @@ test("an inbox discussion can retry after conversation creation fails", async (t
     assert.equal(env.db.getInboxItem(item.id)?.target, undefined);
     calls.mock.mockImplementation(create);
     assert.equal((await env.api("POST", path)).status, 200);
+});
+
+test("an approval that expires unanswered leaves a system item that links its chat; a Deny leaves none", async (t) => {
+    const env = await boot({ approvalTimeoutMs: 100 });
+    t.after(() => env.stop());
+    const h = await env.connect({
+        name: "chief",
+        tools: [{ name: "add_event", writes: true, parameters: { type: "object", properties: {} } }],
+        handlers: { add_event: { text: "ADDED" } },
+    });
+    await waitFor(() => env.core.agent("chief").connected);
+    const sid = h.createSession();
+    env.model.nextTurn(callTurn([{ id: "a", name: "add_event" }, { id: "b", name: "add_event" }]));
+    env.model.nextTurn(textTurn("you did not answer in time"));
+    await env.core.runTurn({ agent: "chief", session: sid, text: "add two", attended: true, title: false });
+
+    const [item] = env.db.listInbox().items;
+    assert.equal(item?.source, "system");
+    assert.equal(item?.agent, null, "the gateway's own notice, never in the agent's name");
+    assert.equal(item?.title, "An approval for chief expired unanswered");
+    assert.equal(item?.level, "warn");
+    assert.deepEqual(item?.target, { kind: "chat", agent: "chief", session: sid });
+    assert.equal(env.db.getInboxItem(item!.id)?.body, "Nobody answered in time, so none of its 2 calls ran.");
+
+    env.model.nextTurn(callTurn([{ id: "c", name: "add_event" }]));
+    env.model.nextTurn(textTurn("not added"));
+    const denied = env.core.runTurn({ agent: "chief", session: sid, text: "add one", attended: true, title: false });
+    await waitFor(() => env.core.approvals.pending().length === 1, 4000, "the gate");
+    env.core.approvals.answer(env.core.approvals.pending()[0]!.gate, {});
+    await denied;
+    assert.equal(env.db.listInbox().items.length, 1);
 });

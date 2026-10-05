@@ -447,6 +447,57 @@ test("rooms: the stream re-attaches to a running turn with a full replay", async
     }
 });
 
+test("rooms: an ask that names no chat reaches the room only from the room turn's own running tool", async () => {
+    const env = await boot();
+    try {
+        let dana: Awaited<ReturnType<Env["connect"]>> | null = null;
+        dana = await env.connect({
+            name: "dana",
+            tools: [
+                { name: "send_email", writes: true, parameters: { type: "object", properties: {} } },
+                { name: "wire", writes: false, parameters: { type: "object", properties: {} } },
+            ],
+            handlers: {
+                send_email: { text: "SENT" },
+                wire: async () => {
+                    dana?.send({ id: "mid", type: "ask_approve", payload: { label: "wire 40 EUR" } });
+                    await waitFor(() => dana?.frames().some((f) => f["id"] === "mid") === true, 4000, "the mid-tool answer");
+                    return { text: "WIRED" };
+                },
+            },
+        });
+        await ready(env, "dana");
+        const room = await createRoom(env);
+        await join(env, room, "dana");
+
+        env.model.nextTurn(callTurn([{ id: "c1", name: "send_email" }]));
+        env.model.nextTurn(callTurn([{ id: "c2", name: "wire" }]));
+        env.model.nextTurn(textTurn("all done"));
+        const live = await env.stream("POST", `/api/rooms/${room}/messages`, { text: "send and wire", to: "dana" });
+        await waitFor(() => env.core.approvals.pending().length === 1, 4000, "the room's gate");
+        const own = env.core.approvals.pending()[0]!.gate;
+
+        // a cron of dana's asks while the room turn waits on its own gate
+        dana.send({ id: "cron", type: "ask_approve", payload: { label: "renew the domain" } });
+        await waitFor(() => env.core.approvals.pending().length === 2, 4000, "the cron's gate");
+        const cron = env.core.approvals.pending().find((g) => g.gate !== own)!.gate;
+        env.core.approvals.answer(cron, {});
+        await waitFor(() => dana!.frames().some((f) => f["id"] === "cron"), 4000, "the cron's answer");
+        const gated = (): unknown[] => live.lines.filter((e) => e["type"] === "approval_required" || e["type"] === "approval_resolved").map((e) => e["gate"]);
+        assert.deepEqual(gated(), [own], "the cron's card never enters the room");
+
+        env.core.approvals.answer(own, { c1: true });
+        await waitFor(() => env.core.approvals.pending().length === 1, 4000, "the mid-tool gate");
+        const mid = env.core.approvals.pending()[0]!.gate;
+        env.core.approvals.answer(mid, { a1: true });
+        await live.done;
+        assert.deepEqual(gated(), [own, own, mid, mid], "the room tool's own ask belongs to the room");
+        assert.equal(live.lines.at(-1)?.["answer"], "all done");
+    } finally {
+        await env.stop();
+    }
+});
+
 test("rooms: a routed send is refused before anything is published", async () => {
     const env = await boot();
     try {

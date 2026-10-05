@@ -250,7 +250,7 @@ test("an invoke with no deadline carries none, outlives the default timeout and 
         await waitFor(() => h.invokes().length === 1, 4000, "the invoke");
         assert.equal(h.invokes()[0]?.["deadline"], undefined);
         // nothing for a mid-invoke approval to be clamped to either
-        assert.equal(env.core.registry.get("toto")?.deadlineAt, undefined);
+        assert.equal(env.core.registry.get("toto")?.deadlineAt(), undefined);
 
         // the knob is live: the same silent tool, asked with no timeout of its own, is cut at 400 ms
         const plain = env.core.registry.get("toto")!.request("invoke", { tool: "look", args: {} });
@@ -345,6 +345,135 @@ test("a denied write tool never leaves the gateway — the agent got no invoke",
         assert.equal(h.invokes().length, 0, "the fake agent received no invoke");
         const result = messagesOf(h, sid).find((m) => m.role === "tool");
         assert.match(String(result?.content), /DENIED/);
+    } finally {
+        await env.stop();
+    }
+});
+
+test("an approval nobody answers expires: the model hears it timed out, never that the owner denied it", async () => {
+    const env = await boot({ approvalTimeoutMs: 100 });
+    try {
+        const h = await connected(env, {
+            name: "toto",
+            manifest: { chain: true },
+            tools: [{ name: "send_email", writes: true, parameters: { type: "object", properties: {} } }],
+            handlers: { send_email: { text: "SENT" } },
+        });
+        const sid = h.createSession();
+        env.model.nextTurn(callTurn([
+            { id: "w1", name: "send_email" },
+            { id: "c1", name: "chain", args: JSON.stringify({ steps: [{ tool: "send_email" }] }) },
+        ]));
+        env.model.nextTurn(textTurn("you did not answer in time"));
+
+        await env.core.runTurn({ agent: "toto", session: sid, text: "mail them", attended: true, title: false });
+        assert.equal(h.invokes().length, 0, "an expired call is never sent");
+        const results = messagesOf(h, sid).filter((m) => m.role === "tool");
+        const batch = String(results.find((m) => m.tool_call_id === "w1")?.content);
+        assert.equal(
+            batch,
+            "Not run: the approval request EXPIRED unanswered after 5 minutes. The owner did not deny it. " +
+                "Tell them it timed out and offer to send it again.",
+        );
+        const step = String(results.find((m) => m.tool_call_id === "c1")?.content);
+        assert.match(step, /FAILED: the approval for "send_email" expired unanswered after 5 minutes/);
+        assert.doesNotMatch(batch + step, /DENIED|denied "/);
+    } finally {
+        await env.stop();
+    }
+});
+
+test("write calls past the run's budget are refused before the gate, so the owner never allows what cannot run", async () => {
+    const env = await boot();
+    try {
+        const h = await connected(env, {
+            name: "toto",
+            manifest: { policy: { budgets: { send_email: 2 } } },
+            tools: [{ name: "send_email", writes: true, parameters: { type: "object", properties: {} } }],
+            handlers: { send_email: { text: "SENT" } },
+        });
+        const sid = h.createSession();
+        env.model.nextTurn(callTurn(["w1", "w2", "w3", "w4"].map((id) => ({ id, name: "send_email" }))));
+        env.model.nextTurn(textTurn("two sent"));
+
+        const turn = env.core.runTurn({ agent: "toto", session: sid, text: "mail four", attended: true, title: false });
+        await waitFor(() => env.core.approvals.pending().length === 1, 4000, "the gate");
+        const gate = env.core.approvals.pending()[0]!.gate;
+        assert.deepEqual(env.core.approvals.describe(gate)?.actions.map((a) => a.id), ["w1", "w2"], "only what the budget lets run");
+        env.core.approvals.answer(gate, { w1: true, w2: true });
+        await turn;
+
+        assert.equal(h.invokes().length, 2);
+        const results = messagesOf(h, sid).filter((m) => m.role === "tool");
+        for (const id of ["w3", "w4"]) {
+            assert.equal(results.find((m) => m.tool_call_id === id)?.content, 'Denied: the call budget for "send_email" in this run is exhausted.');
+        }
+    } finally {
+        await env.stop();
+    }
+});
+
+test("an agent that disconnects while its gate waits: the calls read as not run, never as the owner's stop", async () => {
+    const env = await boot();
+    try {
+        const h = await connected(env, {
+            name: "toto",
+            tools: [{ name: "send_email", writes: true, parameters: { type: "object", properties: {} } }],
+            handlers: { send_email: { text: "SENT" } },
+        });
+        const sid = h.createSession();
+        env.model.nextTurn(callTurn([{ id: "w1", name: "send_email" }, { id: "w2", name: "send_email" }]));
+
+        const events: Array<Record<string, unknown>> = [];
+        const run = env.core.turns.start(
+            { agent: "toto", session: sid, text: "mail them", attended: true, title: false, emit: (ev) => void events.push(ev) },
+            (outcome) => ({ type: "done", answer: outcome.text }),
+        );
+        await waitFor(() => env.core.approvals.pending().length === 1, 4000, "the gate");
+        h.close();
+        await run.finished;
+
+        assert.equal(events.find((ev) => ev["type"] === "approval_resolved")?.["outcome"], "gone");
+        assert.deepEqual(
+            events.filter((ev) => ev["type"] === "tool_result").map((ev) => ev["text"]),
+            Array(2).fill("Not run: the agent disconnected while this call waited."),
+        );
+        assert.equal(events.at(-1)?.["answer"], "The agent disconnected before completion.");
+        assert.equal(JSON.stringify(events).includes("stopped by user"), false);
+    } finally {
+        await env.stop();
+    }
+});
+
+test("a chat's own approval keeps its five minutes while the agent serves an a2a invoke", async () => {
+    const env = await boot();
+    try {
+        let release = (): void => undefined;
+        const h = await connected(env, {
+            name: "toto",
+            manifest: { a2a: { commands: ["slow"] } },
+            tools: [{ name: "slow", writes: false, parameters: { type: "object", properties: {} } }],
+            handlers: { slow: () => new Promise((done) => { release = () => done({ text: "SLOW" }); }) },
+        });
+        const sid = h.createSession();
+        // another agent's request with the 60 s a2a deadline, still unanswered
+        const served = env.core.registry.get("toto")!.request("a2a_invoke", { from: "mate", command: "slow", args: {} }, { deadline: 60_000 });
+        await waitFor(() => h.frames().some((f) => f["type"] === "a2a_invoke"), 4000, "the a2a invoke");
+
+        h.send({ id: "k1", type: "ask_approve", payload: { label: "add the event", session: sid } });
+        await waitFor(() => env.core.approvals.pending().length === 1, 4000, "the chat's gate");
+        const chat = env.core.approvals.pending()[0]!;
+        assert.ok(chat.deadline - Date.now() > 4 * 60_000, "not capped by the a2a deadline");
+
+        // an ask that names no chat may come from that a2a invoke, so it still dies with it
+        h.send({ id: "k2", type: "ask_approve", payload: { label: "ship it" } });
+        await waitFor(() => env.core.approvals.pending().length === 2, 4000, "the session-less gate");
+        const loose = env.core.approvals.pending().find((g) => g.gate !== chat.gate)!;
+        assert.ok(loose.deadline - Date.now() <= 60_000);
+
+        for (const g of env.core.approvals.pending()) env.core.approvals.answer(g.gate, { a1: false });
+        release();
+        await served;
     } finally {
         await env.stop();
     }

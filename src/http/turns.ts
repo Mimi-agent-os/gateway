@@ -30,7 +30,6 @@ export function reattach(ctx: Ctx, run: TurnRun): void {
     ctx.res.writeHead(200, NDJSON);
     const detach = run.attach((event) => { ctx.res.write(`${JSON.stringify(event)}\n`); });
     ctx.res.on("close", detach);
-    // Ending a superseded stream at handoff would make the old client reconnect and steal it back.
     void run.finished.then(() => ctx.res.end());
 }
 

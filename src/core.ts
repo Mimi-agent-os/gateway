@@ -59,6 +59,10 @@ export interface GatewayCoreOptions {
     defaultTimeoutMs?: number | undefined;
     /** Tests only: how long an ask_owner question waits for the owner. */
     questionTimeoutMs?: number | undefined;
+    /** Tests only: how long an approval waits for the owner (5 min). */
+    approvalTimeoutMs?: number | undefined;
+    /** Tests only: when an open gate asks push again for a phone that froze as it parked (61 s). */
+    gateRewakeMs?: number | undefined;
     /** Tests only: the launch-session lifetime, and the bridge's reply deadlines. */
     apps?: { ttlMs?: number | undefined; headMs?: number | undefined; stallMs?: number | undefined };
     /** Tests only: device-plane clocks, sweeps and pre-auth bounds. */
@@ -127,6 +131,8 @@ const CHAT_IN_FLIGHT_MAX = 4;
 /** An agent's own chat notices fold per window: one trailing chat_changed per chat, at most this many chats. */
 const CHANGED_WINDOW_MS = 250;
 const CHANGED_CHATS_MAX = 32;
+/** Past push's 60 s "heard from" mark and its 30 s per-device window: a phone silent since the park is due by then. */
+const GATE_REWAKE_MS = 61_000;
 
 export function createGatewayCore(opts: GatewayCoreOptions = {}): GatewayCore {
     const db = opts.db ?? gatewayDb();
@@ -136,10 +142,40 @@ export function createGatewayCore(opts: GatewayCoreOptions = {}): GatewayCore {
     const gates = new Gates({
         log,
         questionTimeoutMs: opts.questionTimeoutMs,
-        onPark: (g) =>
-            events.emit({ type: "approval", kind: g.kind, agent: g.agent, session: g.session, room: g.room ?? undefined, tool: g.tool }),
-        // keyed by the gate id the device decided against, so a stale card can be retired everywhere
-        onResolve: (g) => events.emit({ type: "approval_resolved", gate: g.gate, outcome: g.outcome }),
+        approvalTimeoutMs: opts.approvalTimeoutMs,
+        onPark: (g) => {
+            events.emit({
+                type: "approval",
+                kind: g.kind,
+                agent: g.agent,
+                session: g.session,
+                room: g.room ?? undefined,
+                gate: g.gate,
+                tool: g.tool,
+                actions: g.actions,
+            });
+            // a phone that froze just before the park still counted as online then, and nothing else wakes it while the gate waits
+            const again = setTimeout(() => {
+                if (gates.pending().some((p) => p.gate === g.gate)) void push.wake();
+            }, opts.gateRewakeMs ?? GATE_REWAKE_MS);
+            again.unref();
+        },
+        onResolve: (g) => {
+            // keyed by the gate id the device decided against, so a stale card can be retired everywhere
+            events.emit({ type: "approval_resolved", gate: g.gate, outcome: g.outcome });
+            if (g.kind !== "approval" || g.outcome !== "expired") return;
+            // the one record that the owner never answered, not refused: the turn's card goes with the turn
+            const row = db.insertInboxItem({
+                source: "system",
+                title: `An approval for ${g.agent} expired unanswered`,
+                body: g.actions === 1
+                    ? "Nobody answered in time, so the call did not run."
+                    : `Nobody answered in time, so none of its ${g.actions} calls ran.`,
+                level: "warn",
+                target: g.session === null ? null : { kind: "chat", agent: g.agent, session: g.session },
+            });
+            events.emit({ type: "inbox_item", id: row.id, source: row.source, agent: row.agent, title: row.title, level: row.level });
+        },
     });
     const registry = new Registry({
         db,
@@ -288,8 +324,8 @@ export function createGatewayCore(opts: GatewayCoreOptions = {}): GatewayCore {
         },
         get: (agent, session) => {
             if (session !== null) return runs.get(`${agent}#${session}`);
-            // an agent-originated approval names no chat: it reaches the latest session-less turn
-            return [...runs.values()].findLast((run) => run.agent === agent && run.session === null);
+            // an ask that names no chat belongs to a room turn only while that turn runs a tool; a cron's is nobody's turn
+            return [...runs.values()].findLast((run) => run.agent === agent && run.session === null && run.inTool);
         },
         room: (room) => runs.get(`room#${room}`),
         forAgent: (agent) => [...runs.values()].filter((run) => run.agent === agent),
@@ -303,8 +339,8 @@ export function createGatewayCore(opts: GatewayCoreOptions = {}): GatewayCore {
 
     // a gate, a turn and a model call belong to the connection and the admission that started them:
     // the socket going away, a block, a revoke and a pause all settle them here
-    registry.onStopped = (name) => {
-        for (const run of turns.forAgent(name)) run.stop();
+    registry.onStopped = (name, why) => {
+        for (const run of turns.forAgent(name)) run.stop(why);
         gates.cancel(name);
         for (const call of chatCalls.get(name) ?? []) {
             call.abort(new PeerError(`"${name}" stopped — the call was cancelled`, "denied"));
@@ -357,12 +393,12 @@ export function createGatewayCore(opts: GatewayCoreOptions = {}): GatewayCore {
                 agent: peer.name,
                 session,
                 emit: turns.get(peer.name, session)?.emit,
-                // asked from inside a request the gateway set a deadline on (an invoke, an a2a
-                // invoke): the SDK stops listening when that deadline passes, so the card dies with it
-                deadline: peer.deadlineAt,
+                // asked from inside a request the gateway set a deadline on: the SDK stops listening when
+                // that deadline passes, so the card dies with it. A chat's ask comes from a chat invoke, never an a2a one
+                deadline: peer.deadlineAt(session === null ? undefined : "invoke"),
             };
-            const approved = await gates.askOne(ctx, label, detail);
-            return { approved, ...(approved ? {} : { reason: "denied" }) };
+            const outcome = await gates.askOne(ctx, label, detail);
+            return outcome === "approved" ? { approved: true } : { approved: false, reason: outcome };
         },
         a2aCall: (peer, p) =>
             track(
@@ -383,7 +419,7 @@ export function createGatewayCore(opts: GatewayCoreOptions = {}): GatewayCore {
                         session: null,
                         emit: turns.get(peer.name, null)?.emit,
                         // as ask_approve: the card dies with the request this caller is serving
-                        deadline: peer.deadlineAt,
+                        deadline: peer.deadlineAt(),
                     };
                     const result = await runA2a(deps, { from: peer.name, target, command, args, gateCtx: ctx });
                     return { result };

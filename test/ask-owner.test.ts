@@ -170,7 +170,7 @@ test("a question gate waits twelve hours, and only its own kind of answer settle
     assert.equal(gates.reply(q.gate, [{ selected: ["SQLite"] }, { selected: ["Auth"] }]), true);
     assert.deepEqual(await question, [{ selected: ["SQLite"] }, { selected: ["Auth"] }]);
     gates.stop();
-    assert.deepEqual(await approval, { w1: false });
+    assert.deepEqual(await approval, { decisions: { w1: false }, outcome: "gone" });
 });
 
 test("an expired question resolves unanswered, on the turn stream and to the devices", async () => {

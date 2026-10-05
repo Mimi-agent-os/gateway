@@ -366,6 +366,49 @@ test("all reattached HTTP streams close at turn finish after receiving replayed 
     }
 });
 
+test("every device on a running chat gets each later gate and the end, whichever attached last", { timeout: 10_000 }, async () => {
+    const env = await boot({ contextTokens: 4000 });
+    try {
+        const h = await connected(env, {
+            name: "toto",
+            tools: [{ name: "add_event", writes: true, parameters: { type: "object", properties: {} } }],
+            handlers: { add_event: { text: "added" } },
+        });
+        const session = h.createSession("two devices", true);
+        // two rounds of two writes each: the second gate parks after a second device opened the chat
+        env.model.nextTurn(callTurn([{ id: "a", name: "add_event" }, { id: "b", name: "add_event" }]));
+        env.model.nextTurn(callTurn([{ id: "c", name: "add_event" }, { id: "d", name: "add_event" }]));
+        env.model.nextTurn(textTurn("four added"));
+        const gates = (s: NdjsonStream): unknown[] => s.lines.filter((ev) => ev["type"] === "approval_required").map((ev) => ev["gate"]);
+
+        const desktop = await env.stream("POST", `/api/agents/toto/conversations/${session}/messages`, { text: "add four" });
+        await waitFor(() => env.core.approvals.pending().length === 1, 4000, "gate 1");
+        const phone = await env.stream("GET", `/api/agents/toto/conversations/${session}/stream`);
+        await waitFor(() => gates(phone).length === 1, 4000, "the phone's replay");
+        const first = env.core.approvals.pending()[0]!.gate;
+        env.core.approvals.answer(first, { a: true, b: true });
+
+        await waitFor(() => env.core.approvals.pending().length === 1 && env.core.approvals.pending()[0]!.gate !== first, 4000, "gate 2");
+        const second = env.core.approvals.pending()[0]!.gate;
+        await waitFor(() => gates(desktop).length === 2 && gates(phone).length === 2, 4000, "gate 2 on both devices");
+        assert.deepEqual(gates(desktop), [first, second], "the device that attached first still gets the second gate");
+        for (const s of [desktop, phone]) {
+            assert.ok(s.lines.some((ev) => ev["type"] === "approval_resolved" && ev["gate"] === first), "and the first one's resolution");
+        }
+
+        // the phone goes away: the desktop keeps the turn to its end
+        phone.close();
+        await new Promise((r) => setTimeout(r, 50));
+        env.core.approvals.answer(second, { c: true, d: true });
+        await desktop.done;
+        assert.equal(desktop.lines.at(-1)?.["type"], "done");
+        assert.equal(desktop.lines.at(-1)?.["answer"], "four added");
+        assert.equal(h.invokes().length, 4);
+    } finally {
+        await env.stop();
+    }
+});
+
 test("closing one concurrent chat stream does not stop another chat", { timeout: 10_000 }, async () => {
     const env = await boot({ contextTokens: 4000 });
     const aliceModel = createControlledModel();

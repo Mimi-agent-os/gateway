@@ -23,6 +23,7 @@ import {
     toolTrafficSummary,
 } from "./compaction.ts";
 import type { GateAction, GateContext } from "../gates/gate-types.ts";
+import { APPROVAL_TIMEOUT_MS } from "../gates/gates.ts";
 import { buildGatewayTools, type GatewayToolCtx } from "./gateway-tools.ts";
 import { systemPrompt, visibleTo } from "./prompt.ts";
 import { NotSentError } from "../llm/base/index.ts";
@@ -41,10 +42,16 @@ import {
 } from "./loop-types.ts";
 import { MAX_STREAM0_BYTES } from "../registry/devices.ts";
 import { PeerError } from "../registry/peer.ts";
+import { AgentGone } from "./run.ts";
 
 const DENIED =
     "The user DENIED this tool call (or no interactive approval is available in this run). " +
     "Do not retry it; report the denial in your answer.";
+
+const EXPIRED_AFTER = `${APPROVAL_TIMEOUT_MS / 60_000} minutes`;
+const EXPIRED =
+    `Not run: the approval request EXPIRED unanswered after ${EXPIRED_AFTER}. The owner did not deny it. ` +
+    "Tell them it timed out and offer to send it again.";
 
 /** What one stored event may serialize to: its append, and the events_after page that later
  *  carries it back, must each fit one channel message with the frame around it. */
@@ -241,12 +248,19 @@ export async function runTurn(deps: LoopDeps, req: TurnRequest): Promise<TurnOut
     }
 
     async function stopped(results: EventBody[] = []): Promise<TurnOutcome> {
+        const gone = req.signal?.reason instanceof AgentGone;
         // Persist tool-call closeout even after stop; a dead peer must not hold shutdown indefinitely.
         await append([
             ...results,
-            messageEvent({ role: "assistant", content: "[stopped by user]" }, undefined, SYSTEM_NOTE),
+            messageEvent({ role: "assistant", content: gone ? "[stopped: the agent disconnected]" : "[stopped by user]" }, undefined, SYSTEM_NOTE),
         ], AbortSignal.timeout(5_000));
-        return { text: "Stopped by user before completion.", rounds, dropped, titling: null, metrics: metricsNow() };
+        return {
+            text: gone ? "The agent disconnected before completion." : "Stopped by user before completion.",
+            rounds,
+            dropped,
+            titling: null,
+            metrics: metricsNow(),
+        };
     }
 
     const overBudget = (name: string): boolean => {
@@ -262,8 +276,9 @@ export async function runTurn(deps: LoopDeps, req: TurnRequest): Promise<TurnOut
         if (allowed && !allowed.has(name)) throw new Error(`"${name}" is not in this run's plan`);
         if (overBudget(name)) throw new Error(`the call budget for "${name}" in this run is exhausted`);
         if (tool.schema.writes) {
-            const ok = req.attended === true ? await deps.gates.askOne(gateCtx, name, args) : false;
-            if (!ok) throw new Error(`the user denied "${name}"`);
+            const outcome = req.attended === true ? await deps.gates.askOne(gateCtx, name, args) : "denied";
+            if (outcome === "expired") throw new Error(`the approval for "${name}" expired unanswered after ${EXPIRED_AFTER}`);
+            if (outcome !== "approved") throw new Error(`the user denied "${name}"`);
         }
         spent.set(name, (spent.get(name) ?? 0) + 1);
         return execute(tool, name, args);
@@ -560,6 +575,9 @@ export async function runTurn(deps: LoopDeps, req: TurnRequest): Promise<TurnOut
 
         const planned: PlannedCall[] = [];
         const gated: GateAction[] = [];
+        // a budget binds at planning too: a call past it is refused here, never put on the gate
+        const claimed = new Map<string, number>();
+        const overCap = new Set<string>();
         for (const call of calls) {
             let args: Record<string, unknown> | null = null;
             let argsError = "";
@@ -575,22 +593,26 @@ export async function runTurn(deps: LoopDeps, req: TurnRequest): Promise<TurnOut
                 argsError = `tool arguments were not valid JSON (${(e as Error).message})`;
             }
             planned.push({ call, args, argsError });
-            if (
-                args !== null &&
-                (!allowed || allowed.has(call.name)) &&
-                !overBudget(call.name) &&
-                tools.get(call.name)?.schema.writes === true
-            ) {
-                gated.push({ id: call.id, tool: call.name, args });
+            const tool = tools.get(call.name);
+            if (args === null || (allowed && !allowed.has(call.name)) || !tool) continue;
+            const used = (spent.get(call.name) ?? 0) + (claimed.get(call.name) ?? 0);
+            const cap = budgets?.[call.name];
+            if (cap !== undefined && used >= cap) {
+                overCap.add(call.id);
+                continue;
             }
+            claimed.set(call.name, (claimed.get(call.name) ?? 0) + 1);
+            if (tool.schema.writes === true) gated.push({ id: call.id, tool: call.name, args });
         }
 
         const decisions = new Map<string, boolean>();
+        let expired = false;
         if (gated.length) {
             if (req.attended === true && !req.signal?.aborted) {
                 try {
-                    const answers = await deps.gates.ask(gateCtx, gated);
-                    for (const g of gated) decisions.set(g.id, answers[g.id] === true);
+                    const verdict = await deps.gates.ask(gateCtx, gated);
+                    expired = verdict.outcome === "expired";
+                    for (const g of gated) decisions.set(g.id, verdict.decisions[g.id] === true);
                 } catch {
                     for (const g of gated) decisions.set(g.id, false);
                 }
@@ -608,12 +630,14 @@ export async function runTurn(deps: LoopDeps, req: TurnRequest): Promise<TurnOut
             else usedNonFoldTool = true;
             let out: string;
             if (req.signal?.aborted) {
-                out = "Skipped: stopped by user.";
+                out = req.signal.reason instanceof AgentGone
+                    ? "Not run: the agent disconnected while this call waited."
+                    : "Skipped: stopped by user.";
             } else if (args === null) {
                 out = `Error: ${argsError}. Fix the arguments and call again.`;
             } else if (allowed && !allowed.has(call.name)) {
                 out = `Denied: "${call.name}" is not in this run's plan. Do not retry it.`;
-            } else if (overBudget(call.name)) {
+            } else if (overCap.has(call.id) || overBudget(call.name)) {
                 out = `Denied: the call budget for "${call.name}" in this run is exhausted.`;
             } else {
                 const tool = tools.get(call.name);
@@ -621,7 +645,7 @@ export async function runTurn(deps: LoopDeps, req: TurnRequest): Promise<TurnOut
                     out = `Error: unknown tool "${call.name}".`;
                 } else if (tool.schema.writes && decisions.get(call.id) !== true) {
                     // the invoke is NEVER SENT: a denied write tool does not leave the gateway
-                    out = DENIED;
+                    out = expired ? EXPIRED : DENIED;
                 } else {
                     spent.set(call.name, (spent.get(call.name) ?? 0) + 1);
                     emit?.({ type: "tool_call", id: call.id, name: call.name, args });

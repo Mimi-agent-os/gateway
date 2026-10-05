@@ -108,13 +108,13 @@ export async function runA2a(deps: LoopDeps, call: A2aRequest): Promise<ResultPa
     });
 
     if (writes) {
-        const approved = await deps.gates.askOne(
+        const outcome = await deps.gates.askOne(
             call.gateCtx,
             `a2a ${call.target}.${call.command}`,
             call.args,
             (gate) => advanceInteraction(deps, record.id, { gate }),
         );
-        if (!approved) {
+        if (outcome !== "approved") {
             advanceInteraction(deps, record.id, { status: "denied", durationMs: Date.now() - t0 });
             throw new PeerError(`the user denied "${call.target}.${call.command}".`, "denied");
         }

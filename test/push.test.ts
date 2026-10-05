@@ -423,3 +423,35 @@ test("a ready session silent for a minute counts as offline: a frozen app still 
         await env.stop();
     }
 });
+
+test("a gate parked while the phone still counted as online is pushed once the phone has gone quiet, unless it was answered", async () => {
+    const g = google();
+    let now = Date.now();
+    const env = await boot({ devices: { now: () => now }, push: { account, fetch: g.fetch, now: () => now }, gateRewakeMs: 200 });
+    try {
+        // the phone answered something and was locked: its frozen app still holds the socket
+        assert.equal((await env.api("PUT", "/api/devices/me/push", { token: "token-phone" })).status, 200);
+        const h = await env.connect({ name: "toto" });
+        await waitFor(() => env.core.registry.get("toto") !== undefined, 4000, "registration");
+
+        now += 10_000;
+        h.send({ id: "k1", type: "ask_approve", payload: { label: "add the Sunday review" } });
+        await waitFor(() => env.core.approvals.pending().length === 1, 4000, "the gate");
+        assert.equal(g.sends().length, 0, "heard 10 s ago: online at the park");
+        now += 61_000;
+        await waitFor(() => g.sends().length === 1, 4000, "the push once the phone went quiet");
+        assert.equal(sentTo(g.sends()[0]!), "token-phone");
+
+        now += 30_000;
+        h.send({ id: "k2", type: "ask_approve", payload: { label: "add the other review" } });
+        await waitFor(() => env.core.approvals.pending().length === 2, 4000, "the second gate");
+        await waitFor(() => g.sends().length === 2, 4000, "the park-time push to the quiet phone");
+        const second = env.core.approvals.pending().find((p) => p.tool === "add the other review")!;
+        env.core.approvals.answer(second.gate, { a1: true });
+        now += 61_000;
+        await new Promise((r) => setTimeout(r, 400));
+        assert.equal(g.sends().length, 2, "an answered gate is not pushed again");
+    } finally {
+        await env.stop();
+    }
+});
