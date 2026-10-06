@@ -41,7 +41,6 @@ export function registerTurns(router: Router, core: GatewayCore): void {
         const body = await readBody(ctx.req);
         const rawText = body["text"];
         const text = typeof rawText === "string" ? rawText.trim() : "";
-        if (!text) return json(ctx.res, 400, { error: "pass { text }" });
 
         const rawImages = body["images"];
         let images: string[] | undefined;
@@ -58,6 +57,8 @@ export function registerTurns(router: Router, core: GatewayCore): void {
             }
             images = rawImages;
         }
+        // images alone are a message (the model gets image parts only); neither words nor images is not
+        if (!text && !images?.length) return json(ctx.res, 400, { error: "pass { text } or { images }" });
 
         if (core.turns.get(agent, session)) return json(ctx.res, 409, { error: "a turn is already running in this chat" });
         // the one route a person types into: only it can vouch that a human authored this

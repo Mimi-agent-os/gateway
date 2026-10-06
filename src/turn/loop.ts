@@ -113,6 +113,8 @@ export async function runTurn(deps: LoopDeps, req: TurnRequest): Promise<TurnOut
     const spent = new Map<string, number>();
 
     let answer = "";
+    /** The model's own final words: unlike `answer`, never a note the gateway wrote in its place. */
+    let reply = "";
     /** A room turn's own rounds: assistant lines and tool results the model needs next round and
      *  the shared transcript must never see — only the published reply goes back to the room. */
     const working: Message[] = [];
@@ -535,12 +537,14 @@ export async function runTurn(deps: LoopDeps, req: TurnRequest): Promise<TurnOut
             await append([
                 messageEvent({ role: "assistant", content: text ? `${text}\n${note}` : note }, thinking),
             ]);
-            answer = text.trim() || note;
+            reply = text.trim();
+            answer = reply || note;
             break;
         }
 
         if (calls.length === 0) {
-            answer = text.trim() || `No answer produced by the "${scope}" agent.`;
+            reply = text.trim();
+            answer = reply || `No answer produced by the "${scope}" agent.`;
             // store the fallback too, not an empty string: a model that ends its turn with no text
             // (e.g. after a run of tool calls) must leave a visible line, never a blank bubble
             await append([messageEvent({ role: "assistant", content: text.trim() ? text : answer }, thinking)]);
@@ -710,6 +714,7 @@ export async function runTurn(deps: LoopDeps, req: TurnRequest): Promise<TurnOut
                   session,
                   peer,
                   seed: req.text,
+                  reply,
                   model: cfg.name,
                   turnSeq,
                   db: deps.db,

@@ -175,10 +175,13 @@ function messageChars(m: Message): number {
 function flattenForSummary(messages: readonly Message[]): string[] {
     const lines: string[] = [];
     for (const m of messages) {
-        const body =
+        const text =
             typeof m.content === "string" && m.content
                 ? m.content
                 : (m.tool_calls?.map((c) => `${c.name}(${c.arguments})`).join("; ") ?? "");
+        // images sent without words still happened: the reply to them must not read as answering nothing
+        const pictures = m.images?.length ?? 0;
+        const body = pictures ? `[${pictures} image${pictures === 1 ? "" : "s"}]${text ? ` ${text}` : ""}` : text;
         if (!body) continue;
         lines.push(
             `${m.role}: ${body.length > SUMMARY_MSG_MAX ? `${body.slice(0, SUMMARY_MSG_MAX)}…` : body}`,

@@ -16,6 +16,8 @@ interface AutoTitleOptions {
     peer: AgentPeer;
     /** The message that opened the thread — a topic is set by the question, not by the answer. */
     seed: string;
+    /** The answer to it, read only when the opening message was images alone and has no words to name. */
+    reply?: string | undefined;
     model?: string | undefined;
     /** The user event that opened the turn this title belongs to, when the caller knows it. */
     turnSeq?: number | null;
@@ -52,8 +54,10 @@ export async function autoTitle(opts: AutoTitleOptions): Promise<boolean> {
     const { agent, session, peer } = opts;
     const db = opts.db ?? gatewayDb();
     const log = opts.log ?? ((): void => undefined);
-    const seed = opts.seed.replace(/\s+/g, " ").trim();
+    const asked = opts.seed.replace(/\s+/g, " ").trim();
+    const seed = asked || (opts.reply ?? "").replace(/\s+/g, " ").trim();
     if (!seed) return false;
+    const opening = asked ? `user: ${seed.slice(0, SEED_CHARS)}` : `user: [images only]\nassistant: ${seed.slice(0, SEED_CHARS)}`;
     try {
         opts.signal?.throwIfAborted();
         const listed = await peer.request(
@@ -80,7 +84,7 @@ export async function autoTitle(opts: AutoTitleOptions): Promise<boolean> {
                 content:
                     "Give this conversation a short title (max 8 words) naming its TOPIC — not " +
                     "a quote of the opening line. Answer in the language the conversation is " +
-                    `in.\n\nuser: ${seed.slice(0, SEED_CHARS)}`,
+                    `in.\n\n${opening}`,
             },
         ];
 

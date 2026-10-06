@@ -268,6 +268,28 @@ test("an oversized last entry never folds the question it answers", () => {
     assert.equal(planCompaction(foldEvents(noUser), 1, t), null);
 });
 
+test("the summarizer reads where images were: an images-only message stays in the transcript", () => {
+    const t = { at: 0.6, keepTailTokens: 500, minPrefixTokens: 250 };
+    const png = "data:image/png;base64,iVBORw0KGgo=";
+    const events = logOf([
+        { type: "message", payload: { role: "user", content: "", images: [png] } },
+        msg("assistant", "a cat on a sofa ".padEnd(600, "x")),
+        { type: "message", payload: { role: "user", content: "and these?", images: [png, png] } },
+        msg("assistant", "two more cats ".padEnd(600, "x")),
+        msg("user", "QUESTION"),
+        msg("assistant", "z".repeat(5_000)),
+    ]);
+
+    const plan = planCompaction(foldEvents(events), 1, t);
+    assert.ok(plan);
+    assert.deepEqual(plan.lines.map((l) => l.slice(0, 30)), [
+        "user: [1 image]",
+        "assistant: a cat on a sofa xxx",
+        "user: [2 images] and these?",
+        "assistant: two more cats xxxxx",
+    ]);
+});
+
 test("manual compaction asks the agent's own model and keeps only a summary that finished cleanly", async () => {
     const env = await boot();
     const roomy = createFakeModel();

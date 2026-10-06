@@ -10,6 +10,7 @@ import { createFakeModel, type FakeModel } from "@mimi-os/sdk/testing";
 
 import { addModel } from "../src/llm/models.ts";
 import type { ModelsPolicy } from "../src/store/db.ts";
+import { autoTitle } from "../src/turn/autotitle.ts";
 import type { Harness } from "./agent-harness.ts";
 import { boot, textTurn, waitFor, type Env } from "./harness-env.ts";
 
@@ -276,6 +277,94 @@ test("POST …/messages takes only inline images within the wire contract, in a 
         assert.equal(turn.status, 200);
         await turn.done;
         assert.deepEqual((h.sessions.get(sid)!.events[0]!.payload as Message).images, [big, big, big, PNG]);
+    } finally {
+        await seer.close();
+        await env.stop();
+    }
+});
+
+test("images alone are a message: a vision model gets only image parts, the history keeps no text, a text-only model reads the note", async () => {
+    const env = await boot();
+    const { h, seer } = await withSeer(env, { allowed: ["fake", "seer"], primary: "seer" });
+    try {
+        const sid = h.createSession("photos", true);
+        const path = `/api/agents/toto/conversations/${sid}/messages`;
+        seer.nextTurn(textTurn("a cat"));
+        const turn = await env.stream("POST", path, { text: "", images: [PNG] });
+        assert.equal(turn.status, 200);
+        await turn.done;
+        assert.deepEqual(sentMessages(seer, 0).find((m) => m.role === "user")?.content, [{ type: "image_url", image_url: { url: PNG } }]);
+        const history = await env.api<{ items: { role: string; content: string; images?: string[] }[] }>("GET", path);
+        assert.deepEqual(history.json.items.map((m) => [m.role, m.content, m.images]), [
+            ["user", "", [PNG]],
+            ["assistant", "a cat", undefined],
+        ]);
+
+        env.model.nextTurn(textTurn("still a cat"));
+        await env.core.runTurn({ agent: "toto", session: sid, text: "and now?", model: "fake", title: false });
+        assert.deepEqual(sentMessages(env.model, 0).filter((m) => m.role === "user").map((m) => m.content), [OMITTED, "and now?"]);
+    } finally {
+        await seer.close();
+        await env.stop();
+    }
+});
+
+test("POST …/messages refuses a message with neither text nor images", async () => {
+    const env = await boot();
+    const { h, seer } = await withSeer(env, { allowed: ["fake", "seer"], primary: "seer" });
+    try {
+        const sid = h.createSession();
+        for (const body of [{}, { text: "  \n " }, { text: "", images: [] }]) {
+            const r = await env.api<{ error?: string }>("POST", `/api/agents/toto/conversations/${sid}/messages`, body);
+            assert.equal(r.status, 400, JSON.stringify(body));
+            assert.equal(r.json.error, "pass { text } or { images }");
+        }
+        assert.equal(seer.requests.length, 0);
+        assert.equal(h.sessions.get(sid)!.events.length, 0);
+    } finally {
+        await seer.close();
+        await env.stop();
+    }
+});
+
+test("a chat opened by images alone is titled from the reply, and nothing to name asks no title at all", async () => {
+    const env = await boot();
+    const { h, seer } = await withSeer(env, { allowed: ["fake", "seer"], primary: "seer" });
+    try {
+        const sid = h.createSession();
+        seer.nextTurn(textTurn("A bakery receipt for two croissants."));
+        seer.nextTurn(textTurn('{"title":"Bakery receipt"}'));
+        const out = await env.core.runTurn({ agent: "toto", session: sid, text: "", images: [PNG] });
+        assert.equal(await out.titling, true);
+        assert.equal(h.sessions.get(sid)!.title, "Bakery receipt");
+        assert.match(String(sentMessages(seer, 1).at(-1)?.content), /\n\nuser: \[images only\]\nassistant: A bakery receipt for two croissants\.$/);
+
+        const peer = env.core.registry.get("toto")!;
+        assert.equal(await autoTitle({ agent: "toto", session: h.createSession(), peer, seed: " ", reply: "", model: "seer", db: env.db }), false);
+        assert.equal(seer.requests.length, 2, "no title call with an empty prompt");
+        assert.deepEqual(env.db.listLlmCalls().map((r) => r.callKind).reverse(), ["turn", "title"]);
+    } finally {
+        await seer.close();
+        await env.stop();
+    }
+});
+
+test("an images-only chat whose reply is a gateway note, not model text, asks no title and stays untitled", async () => {
+    const env = await boot();
+    const { h, seer } = await withSeer(env, { allowed: ["fake", "seer"], primary: "seer" });
+    try {
+        for (const [reason, note] of [
+            ["length", "[response cut off by the token limit]"],
+            ["stop", 'No answer produced by the "toto" agent.'],
+        ] as const) {
+            const sid = h.createSession();
+            seer.nextTurn({ events: [{ kind: "finish", reason }], usage: { prompt_tokens: 10, completion_tokens: 5 } });
+            const out = await env.core.runTurn({ agent: "toto", session: sid, text: "", images: [PNG] });
+            assert.equal(out.text, note);
+            assert.equal(await out.titling, false, reason);
+            assert.equal(h.sessions.get(sid)!.title, null, reason);
+        }
+        assert.equal(seer.requests.length, 2, "no title call for either chat");
     } finally {
         await seer.close();
         await env.stop();
