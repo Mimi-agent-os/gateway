@@ -1,6 +1,6 @@
 /** Name a chat after what it is ABOUT: one cheap call, then a session_update to the agent. */
 
-import type { SessionId } from "@mimi-os/protocol";
+import { parsePasted, type SessionId } from "@mimi-os/protocol";
 
 import { estimateUsage, newCallId, recordLlmCall } from "../store/accounting.ts";
 import { gatewayDb, type GatewayDb } from "../store/db.ts";
@@ -14,7 +14,7 @@ interface AutoTitleOptions {
     agent: string;
     session: SessionId;
     peer: AgentPeer;
-    /** The message that opened the thread — a topic is set by the question, not by the answer. */
+    /** The message that opened the thread, pasted blocks and all — a topic is set by the question, not by the answer. */
     seed: string;
     /** The answer to it, read only when the opening message was images alone and has no words to name. */
     reply?: string | undefined;
@@ -30,8 +30,10 @@ const TITLE_MAX = 120;
 const TITLE_TIMEOUT_MS = 20_000;
 const SEED_CHARS = 600;
 
+const flat = (raw: string): string => raw.replace(/\s+/g, " ").trim();
+
 /** Whitespace collapsed, capped at TITLE_MAX; shared with http/router.ts's title validation. */
-export const normalizeTitle = (raw: string): string => raw.replace(/\s+/g, " ").trim().slice(0, TITLE_MAX);
+export const normalizeTitle = (raw: string): string => flat(raw).slice(0, TITLE_MAX);
 
 /** `{"title":"…"}` out of a model answer; fences and prose around it are tolerated. */
 function parseTitle(text: string): string | null {
@@ -54,10 +56,27 @@ export async function autoTitle(opts: AutoTitleOptions): Promise<boolean> {
     const { agent, session, peer } = opts;
     const db = opts.db ?? gatewayDb();
     const log = opts.log ?? ((): void => undefined);
-    const asked = opts.seed.replace(/\s+/g, " ").trim();
-    const seed = asked || (opts.reply ?? "").replace(/\s+/g, " ").trim();
-    if (!seed) return false;
-    const opening = asked ? `user: ${seed.slice(0, SEED_CHARS)}` : `user: [images only]\nassistant: ${seed.slice(0, SEED_CHARS)}`;
+    // the words, then a line naming each paste while SEED_CHARS lasts and one counting the rest; what room is left goes to the named pastes' starts
+    const { pastes, text } = parsePasted(opts.seed);
+    const typed = flat(text).slice(0, SEED_CHARS);
+    const lines = typed ? [typed] : [];
+    const heads: string[] = [];
+    for (const p of pastes) {
+        const head = `[pasted: ${flat(p.title)}, ${p.lines} line${p.lines === 1 ? "" : "s"}]`;
+        if ([...lines, ...heads, head].join("\n").length > SEED_CHARS) break;
+        heads.push(head);
+    }
+    let room = SEED_CHARS - [...lines, ...heads].join("\n").length;
+    for (const [i, head] of heads.entries()) {
+        const start = flat(pastes[i]!.text).slice(0, Math.max(0, Math.floor(room / (heads.length - i)) - 1));
+        lines.push(start ? `${head} ${start}` : head);
+        if (start) room -= start.length + 1;
+    }
+    const unnamed = pastes.length - heads.length;
+    if (unnamed) lines.push(`[+${unnamed} more pasted text${unnamed === 1 ? "" : "s"}]`);
+    const reply = flat(opts.reply ?? "");
+    if (!lines.length && !reply) return false;
+    const opening = lines.length ? `user: ${lines.join("\n")}` : `user: [images only]\nassistant: ${reply.slice(0, SEED_CHARS)}`;
     try {
         opts.signal?.throwIfAborted();
         const listed = await peer.request(
@@ -156,8 +175,10 @@ export async function autoTitle(opts: AutoTitleOptions): Promise<boolean> {
             }
         }
         if (opts.signal?.aborted) return false;
-        const flat = { session, title: seed.slice(0, 60) };
-        return (await peer.request("session_update", flat, { signal: opts.signal })).applied;
+        // the reply names only a message with nothing of its own to name; an empty title would end titling for good
+        const plain = lines.length ? [typed, ...pastes.flatMap((p) => [flat(p.title), flat(p.text)])].find(Boolean) : reply;
+        if (!plain) return false;
+        return (await peer.request("session_update", { session, title: plain.slice(0, 60) }, { signal: opts.signal })).applied;
     } catch (e) {
         // a title failure that failed a turn would be an absurd trade
         log(`[title] ${agent}#${session}: ${(e as Error).message}\n`);
