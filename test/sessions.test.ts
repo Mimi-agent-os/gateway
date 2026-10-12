@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import type { EventBody, Message } from "@mimi-os/protocol";
+import { momentStamp } from "../src/turn/prompt.ts";
 import { boot, callTurn, drained, textTurn, waitFor } from "./harness-env.ts";
 import type { Env } from "./harness-env.ts";
 import type { Harness } from "./agent-harness.ts";
@@ -39,7 +40,7 @@ test("a higher revision is caught up with a DELTA, not a full reload", async () 
         const again = await env.core.sessions.ensure("toto", sid);
         assert.equal(again.headSeq, 3);
         assert.deepEqual(afterSeqsOf(h), [0, 2], "the delta starts at the cached head");
-        assert.equal(env.core.sessions.history(again).at(-1)?.content, "three");
+        assert.equal(env.core.sessions.history(again).at(-1)?.content, `[${momentStamp(again.events.at(-1)!.createdAt)}]\nthree`);
     } finally {
         await env.stop();
     }
@@ -354,7 +355,7 @@ test("a log that pages out of pages is kept as a prefix and never served as hist
         assert.equal(full.events.length, 450);
         assert.equal(full.headSeq, h.sessions.get(sid)!.headSeq);
         assert.equal(full.headHash, h.sessions.get(sid)!.headHash);
-        assert.equal(env.core.sessions.history(full).at(-1)?.content, "m449");
+        assert.equal(env.core.sessions.history(full).at(-1)?.content, `[${momentStamp(full.events.at(-1)!.createdAt)}]\nm449`);
     } finally {
         await env.stop();
     }

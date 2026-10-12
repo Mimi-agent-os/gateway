@@ -12,6 +12,7 @@ import type { CompactionPayload, EventBody, Message, StoredEvent } from "@mimi-o
 import { createFakeModel } from "@mimi-os/sdk/testing";
 import { addModel } from "../src/llm/models.ts";
 import { planCompaction, thresholdsFor } from "../src/turn/compaction.ts";
+import { momentStamp } from "../src/turn/prompt.ts";
 import { GatewayDb } from "../src/store/db.ts";
 import { boot, callTurn, textTurn, waitFor } from "./harness-env.ts";
 import type { Env } from "./harness-env.ts";
@@ -71,6 +72,26 @@ test("compaction fires once prompt_tokens crosses the fraction, and appends an e
 
         const entry = await env.core.sessions.ensure("toto", sid);
         assert.equal(env.core.sessions.history(entry)[0]?.content, compaction.summary);
+    } finally {
+        await env.stop();
+    }
+});
+
+test("the summarizer reads each user line with the time it was said, so a summary can keep the dates", async () => {
+    const env = await boot();
+    try {
+        const { h, sid } = await seeded(env);
+        const said = Date.UTC(2026, 9, 5, 6, 30);
+        for (const ev of h.sessions.get(sid)!.events) ev.createdAt = said;
+        env.model.nextTurn(textTurn("answered", 900));
+        env.model.nextTurn(textTurn("On Monday the owner asked for x.", 50));
+
+        await env.core.runTurn({ agent: "toto", session: sid, text: "go", title: false });
+
+        const transcript = String((env.model.requests[1]?.["messages"] as Message[])[1]?.content);
+        assert.ok(transcript.includes(`\nuser: [${momentStamp(said)}]\n${BODY.slice(0, 100)}`), transcript.slice(0, 400));
+        assert.equal(transcript.includes("assistant: ["), false, "only the user's lines carry a time");
+        assert.equal(summaryOf(h, sid)?.summary, "On Monday the owner asked for x.");
     } finally {
         await env.stop();
     }

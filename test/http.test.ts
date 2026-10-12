@@ -5,9 +5,10 @@ import assert from "node:assert/strict";
 import { request as rawRequest } from "node:http";
 import test from "node:test";
 
-import type { EventBody, MessageMeta } from "@mimi-os/protocol";
+import type { EventBody, Message, MessageMeta } from "@mimi-os/protocol";
 import type { FakeAgentOptions } from "@mimi-os/sdk/testing";
 
+import { momentStamp } from "../src/turn/prompt.ts";
 import type { Harness } from "./agent-harness.ts";
 import { boot, callTurn, textTurn, waitFor, type Env } from "./harness-env.ts";
 
@@ -462,8 +463,10 @@ test("history: new turns carry actor + callId, the agent's own appends stay bare
         env.model.nextTurn(textTurn("still here"));
         await (await env.stream("POST", `/api/agents/toto/conversations/${id}/messages`, { text: "again" })).done;
         const prompt = env.model.requests.at(-1)?.["messages"] as Array<Record<string, unknown>>;
+        // stamped twice over: `meta` (display, never sent) and the time the model reads it was said at
+        const said = env.core.sessions.entry("toto", id)!.events.find((e) => (e.payload as Message).content === "hi")!.createdAt;
         assert.ok(
-            prompt.some((m) => m["content"] === "hi"),
+            prompt.some((m) => m["content"] === `[${momentStamp(said)}]\nhi`),
             "the stamped message really is in the prompt",
         );
         for (const m of prompt) assert.equal("meta" in m, false);

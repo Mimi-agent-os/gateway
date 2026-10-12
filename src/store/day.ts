@@ -1,4 +1,4 @@
-/** The owner's day: every usage bucket, model limit and "today" is a calendar day in MIMI_TZ. */
+/** The owner's day: every usage bucket, model limit and "today" is a calendar day in MIMI_TZ, and every time a model reads is a time in it. */
 
 const DAY_MS = 86_400_000;
 
@@ -42,7 +42,7 @@ export function setTimeZone(name: string | undefined): string {
 export const timeZone = (): string => zone;
 
 /** The wall clock in the owner's zone at `at`, as UTC milliseconds of that same wall time. */
-function wallMs(at: number): number {
+export function wallMs(at: number): number {
     const p = Object.fromEntries(parts.formatToParts(at).map((x) => [x.type, x.value]));
     return Date.UTC(Number(p["year"]), Number(p["month"]) - 1, Number(p["day"]), Number(p["hour"]), Number(p["minute"]), Number(p["second"]));
 }

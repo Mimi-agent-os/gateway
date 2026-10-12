@@ -37,9 +37,13 @@ const MIN_PREFIX_MESSAGES = 3;
 const SUMMARY_MSG_MAX = 600;
 const SUMMARY_TRANSCRIPT_MAX = 20_000;
 
+// the user lines arrive stamped with when they were said (SessionCache.folded): a summary that
+// keeps the dates keeps "tomorrow" meaning the day it meant. In words, never the bracketed stamp:
+// the summary returns as an assistant line, and a stamp there teaches the model to write them
 const BASE_INSTRUCTION =
     "Compactly summarize this EARLIER PART of a long conversation so the summary can replace " +
-    "it: durable facts, decisions, results, open threads. 3-6 sentences, no preamble.";
+    "it: durable facts, decisions, results, open threads. Where the day matters, name it in the " +
+    "sentence itself, never as a bracketed line. 3-6 sentences, no preamble.";
 
 const SUMMARY_SYSTEM = "You write terse work-session summaries.";
 

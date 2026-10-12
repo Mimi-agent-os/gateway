@@ -9,16 +9,22 @@ import type { Message } from "@mimi-os/protocol";
 import { createFakeModel, type FakeModel } from "@mimi-os/sdk/testing";
 
 import { addModel } from "../src/llm/models.ts";
+import { setTimeZone, timeZone } from "../src/store/day.ts";
 import type { ModelsPolicy } from "../src/store/db.ts";
 import { autoTitle } from "../src/turn/autotitle.ts";
+import { momentStamp, nowStamp } from "../src/turn/prompt.ts";
 import type { Harness } from "./agent-harness.ts";
-import { boot, textTurn, waitFor, type Env } from "./harness-env.ts";
+import { boot, callTurn, textTurn, waitFor, type Env } from "./harness-env.ts";
 
 const PNG = "data:image/png;base64,iVBORw0KGgo=";
 const OMITTED = "[image omitted: this model cannot see images]";
 
 type WireMessage = { role: string; content: unknown };
 const sentMessages = (m: FakeModel, i: number): WireMessage[] => m.requests[i]?.["messages"] as WireMessage[];
+
+/** The stamp toto's user line at `seq` opens with: the time the gateway's cache holds for that event. */
+const stampOf = (env: Env, sid: number, seq: number): string =>
+    `[${momentStamp(env.core.sessions.entry("toto", sid)!.events.find((e) => e.seq === seq)!.createdAt)}]`;
 
 /** A model endpoint that answers every call with this status and SSE body (or none). */
 async function endpoint(status: number, sse = ""): Promise<{ url: string; hits: () => number; close: () => Promise<void> }> {
@@ -70,7 +76,7 @@ test("a text-only model reads older photos as a marker, never as multipart it ca
         await env.core.runTurn({ agent: "toto", session: sid, text: "what is this?", images: [PNG], title: false });
         const withImage = sentMessages(seer, 0).find((m) => m.role === "user")!;
         assert.deepEqual(withImage.content, [
-            { type: "text", text: "what is this?" },
+            { type: "text", text: `${stampOf(env, sid, 1)}\nwhat is this?` },
             { type: "image_url", image_url: { url: PNG } },
         ]);
 
@@ -78,7 +84,7 @@ test("a text-only model reads older photos as a marker, never as multipart it ca
         const out = await env.core.runTurn({ agent: "toto", session: sid, text: "and now?", model: "fake", title: false });
         assert.equal(out.text, "still a cat", "the chat keeps working after switching to a text-only model");
         const blind = sentMessages(env.model, 0);
-        assert.equal(blind.find((m) => m.role === "user")?.content, `what is this?\n${OMITTED}`);
+        assert.equal(blind.find((m) => m.role === "user")?.content, `${stampOf(env, sid, 1)}\nwhat is this?\n${OMITTED}`);
         assert.ok(blind.every((m) => typeof m.content === "string" || m.content === null), "no multipart at all");
     } finally {
         await seer.close();
@@ -102,7 +108,10 @@ test("a turn carrying images never falls back to a text-only model; one without 
         env.model.nextTurn(textTurn("answered by the fallback"));
         const out = await env.core.runTurn({ agent: "toto", session: sid, text: "just text", title: false });
         assert.equal(out.text, "answered by the fallback");
-        assert.equal(sentMessages(env.model, 0).find((m) => m.role === "user")?.content, `what is this?\n${OMITTED}`);
+        assert.equal(
+            sentMessages(env.model, 0).find((m) => m.role === "user")?.content,
+            `${stampOf(env, sid, 1)}\nwhat is this?\n${OMITTED}`,
+        );
     } finally {
         await seer.close();
         await down.close();
@@ -168,12 +177,12 @@ test("withPrompt: a one-shot opens with the same system prompt a turn builds; wi
         assert.equal(reply["status"], "ok", JSON.stringify(reply));
         const [system, user] = sentMessages(env.model, 0);
         assert.equal(system?.role, "system");
-        assert.match(String(system?.content), /^You are Toto, a terse planner\.\n\nThe owner's cat is called Miso\.\n\nCurrent date\/time: \d{4}-\d\d-\d\d \d\d:\d\d$/);
+        assert.match(String(system?.content), /^You are Toto, a terse planner\.\n\nThe owner's cat is called Miso\.\n\nCurrent date\/time: [A-Z][a-z]+day \d{4}-\d\d-\d\d \d\d:\d\d \([\w/+-]+, UTC[+-]\d\d:\d\d\)\nA bracketed line [^\n]+$/);
         assert.deepEqual(user, { role: "user", content: "the cat?" });
 
         env.model.nextTurn(textTurn("Miso"));
         await env.core.runTurn({ agent: "toto", session: h.createSession(), text: "the cat?", title: false });
-        const undated = (m: WireMessage | undefined): string => String(m?.content).replace(/Current date\/time: .*$/, "");
+        const undated = (m: WireMessage | undefined): string => String(m?.content).replace(/Current date\/time: .*/, "");
         assert.equal(undated(sentMessages(env.model, 1)[0]), undated(system), "one builder for both");
 
         env.model.nextTurn(textTurn("Miso"));
@@ -293,7 +302,11 @@ test("images alone are a message: a vision model gets only image parts, the hist
         const turn = await env.stream("POST", path, { text: "", images: [PNG] });
         assert.equal(turn.status, 200);
         await turn.done;
-        assert.deepEqual(sentMessages(seer, 0).find((m) => m.role === "user")?.content, [{ type: "image_url", image_url: { url: PNG } }]);
+        // the words are only the time it was sent: the stamp is the whole text part
+        assert.deepEqual(sentMessages(seer, 0).find((m) => m.role === "user")?.content, [
+            { type: "text", text: stampOf(env, sid, 1) },
+            { type: "image_url", image_url: { url: PNG } },
+        ]);
         const history = await env.api<{ items: { role: string; content: string; images?: string[] }[] }>("GET", path);
         assert.deepEqual(history.json.items.map((m) => [m.role, m.content, m.images]), [
             ["user", "", [PNG]],
@@ -302,7 +315,10 @@ test("images alone are a message: a vision model gets only image parts, the hist
 
         env.model.nextTurn(textTurn("still a cat"));
         await env.core.runTurn({ agent: "toto", session: sid, text: "and now?", model: "fake", title: false });
-        assert.deepEqual(sentMessages(env.model, 0).filter((m) => m.role === "user").map((m) => m.content), [OMITTED, "and now?"]);
+        assert.deepEqual(sentMessages(env.model, 0).filter((m) => m.role === "user").map((m) => m.content), [
+            `${stampOf(env, sid, 1)}\n${OMITTED}`,
+            `${stampOf(env, sid, 3)}\nand now?`,
+        ]);
     } finally {
         await seer.close();
         await env.stop();
@@ -369,4 +385,127 @@ test("an images-only chat whose reply is a gateway note, not model text, asks no
         await seer.close();
         await env.stop();
     }
+});
+
+/** Run `body` in the owner's zone as boot sets it from MIMI_TZ, then put the test's own back. */
+async function inZone(zone: string, body: () => Promise<void> | void): Promise<void> {
+    const was = timeZone();
+    setTimeZone(zone);
+    try {
+        await body();
+    } finally {
+        setTimeZone(was);
+    }
+}
+
+const NOW = "[A-Z][a-z]+day \\d{4}-\\d\\d-\\d\\d \\d\\d:\\d\\d";
+
+test("a moment reads as weekday, date and time in the owner's zone (MIMI_TZ); now names that zone and its offset", async () => {
+    await inZone("Europe/Kyiv", () => {
+        assert.equal(momentStamp(Date.UTC(2026, 9, 12, 7, 4)), "Monday 2026-10-12 10:04");
+        assert.equal(momentStamp(Date.UTC(2026, 9, 12, 21, 0)), "Tuesday 2026-10-13 00:00", "local midnight turns the weekday too");
+        assert.equal(momentStamp(Date.UTC(2026, 0, 12, 21, 59)), "Monday 2026-01-12 23:59", "winter: UTC+02:00");
+        // the owner's spelling, never ICU's older Europe/Kiev
+        assert.match(nowStamp(), new RegExp(`^${NOW} \\(Europe/Kyiv, UTC\\+0[23]:00\\)$`));
+    });
+    await inZone("America/New_York", () => {
+        assert.equal(momentStamp(Date.UTC(2026, 9, 13, 2, 30)), "Monday 2026-10-12 22:30", "the owner's day, not UTC's or the host's");
+        assert.match(nowStamp(), / \(America\/New_York, UTC-0[45]:00\)$/);
+    });
+    await inZone("Asia/Kolkata", () => assert.match(nowStamp(), / \(Asia\/Kolkata, UTC\+05:30\)$/));
+    await inZone("UTC", () => assert.match(nowStamp(), / \(UTC, UTC\+00:00\)$/));
+});
+
+test("the system prompt's date line and get_time's answer are the same weekday-and-zone stamp", async () => {
+    await inZone("Asia/Kolkata", async () => {
+        const env = await boot();
+        try {
+            const h = await env.connect({ name: "toto", tools: [], handlers: {} });
+            await waitFor(() => env.core.registry.get("toto") !== undefined, 4000, "registration");
+            env.model.nextTurn(callTurn([{ id: "t1", name: "get_time" }]));
+            env.model.nextTurn(textTurn("it is late"));
+            await env.core.runTurn({ agent: "toto", session: h.createSession(), text: "what time is it?", title: false });
+
+            const now = `${NOW} \\(Asia/Kolkata, UTC\\+05:30\\)`;
+            // the date line, then the one note that says what a stamp is so the model never writes one
+            assert.match(
+                String(sentMessages(env.model, 0)[0]?.content),
+                new RegExp(`\n\nCurrent date/time: ${now}\nA bracketed line opening a user message is added automatically: [^\n]+ Never write one yourself\\.$`),
+            );
+            assert.match(String(sentMessages(env.model, 1).find((m) => m.role === "tool")?.content), new RegExp(`^${now}$`));
+        } finally {
+            await env.stop();
+        }
+    });
+});
+
+test("each user line carries the time it was stored — never an assistant, tool, system or summary line, never the log or the app", async () => {
+    await inZone("Europe/Kyiv", async () => {
+        const env = await boot();
+        try {
+            const h = await env.connect({ name: "toto", tools: [], handlers: {} });
+            await waitFor(() => env.core.registry.get("toto") !== undefined, 4000, "registration");
+            const sid = h.createSession();
+            h.append(sid, [
+                { type: "message", payload: { role: "user", content: "first question" } },
+                { type: "message", payload: { role: "assistant", content: "first answer" } },
+                { type: "compaction", payload: { summary: "SUMMARY of the first exchange", covers: [1, 2] } },
+                { type: "message", payload: { role: "user", content: "remind me tomorrow to call mom" } },
+                { type: "message", payload: { role: "assistant", content: null, tool_calls: [{ id: "c1", name: "note", arguments: "{}" }] } },
+                { type: "message", payload: { role: "tool", tool_call_id: "c1", content: "noted" } },
+                { type: "message", payload: { role: "assistant", content: "Will do." } },
+                { type: "message", payload: { role: "system", content: "a system line" } },
+                { type: "message", payload: { role: "user", content: "", images: [PNG] } },
+                { type: "message", payload: { role: "assistant", content: "a cat" } },
+            ]);
+            // the times the agent stored, days apart: what each line is stamped with, never the turn's own now
+            const times = [
+                Date.UTC(2026, 9, 3, 8, 0), Date.UTC(2026, 9, 3, 8, 1), Date.UTC(2026, 9, 5, 6, 30),
+                Date.UTC(2026, 9, 5, 6, 30), Date.UTC(2026, 9, 5, 6, 30), Date.UTC(2026, 9, 5, 6, 31),
+                Date.UTC(2026, 9, 5, 6, 31), Date.UTC(2026, 9, 5, 6, 31), Date.UTC(2026, 9, 7, 15, 5),
+                Date.UTC(2026, 9, 7, 15, 6),
+            ];
+            for (const [i, ev] of h.sessions.get(sid)!.events.entries()) ev.createdAt = times[i]!;
+
+            env.model.nextTurn(textTurn("Today is Monday."));
+            env.model.nextTurn(textTurn('{"title":"Calling mom"}'));
+            const out = await env.core.runTurn({ agent: "toto", session: sid, text: "and today?" });
+            assert.equal(await out.titling, true);
+
+            const asked = stampOf(env, sid, 11);
+            assert.deepEqual(sentMessages(env.model, 0).slice(1).map((m) => [m.role, m.content]), [
+                ["assistant", "SUMMARY of the first exchange"],
+                ["user", "[Monday 2026-10-05 09:30]\nremind me tomorrow to call mom"],
+                ["assistant", null],
+                ["tool", "noted"],
+                ["assistant", "Will do."],
+                ["system", "a system line"],
+                ["user", `[Wednesday 2026-10-07 18:05]\n${OMITTED}`],
+                ["assistant", "a cat"],
+                ["user", `${asked}\nand today?`],
+            ]);
+            // a title names a topic: its seed is the words as typed, never a date
+            assert.match(String(sentMessages(env.model, 1).at(-1)?.content), /\n\nuser: and today\?$/);
+
+            // the stamps come from stored times: the next turn's prompt repeats this one byte for byte
+            const entry = await env.core.sessions.ensure("toto", sid);
+            assert.deepEqual(env.core.sessions.history(entry), env.core.sessions.history(entry));
+            env.model.nextTurn(textTurn("Still Monday."));
+            await env.core.runTurn({ agent: "toto", session: sid, text: "sure?", title: false });
+            const first = sentMessages(env.model, 0).slice(1);
+            assert.equal(JSON.stringify(sentMessages(env.model, 2).slice(1, first.length + 1)), JSON.stringify(first));
+
+            // model-facing only: the log keeps what was said, and the app shows it as said
+            const stored = h.sessions.get(sid)!.events.flatMap((e) => (e.type === "message" ? [(e.payload as Message).content] : []));
+            assert.equal(stored.some((c) => typeof c === "string" && /^\[[A-Z][a-z]+day /.test(c)), false, "no stamp in the log");
+            assert.ok(stored.includes("and today?") && stored.includes("sure?"));
+            const shown = await env.api<{ items: { role: string; content: string }[] }>("GET", `/api/agents/toto/conversations/${sid}/messages`);
+            assert.deepEqual(
+                shown.json.items.filter((m) => m.role === "user").map((m) => m.content),
+                ["first question", "remind me tomorrow to call mom", "", "and today?", "sure?"],
+            );
+        } finally {
+            await env.stop();
+        }
+    });
 });

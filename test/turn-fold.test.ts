@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import type { CompactionPayload, EventBody } from "@mimi-os/protocol";
+import { momentStamp } from "../src/turn/prompt.ts";
 import { boot, callTurn, textTurn, waitFor } from "./harness-env.ts";
 import type { Env } from "./harness-env.ts";
 import type { Harness } from "./agent-harness.ts";
@@ -113,11 +114,12 @@ test("auto-fold waits for the turn's end: the model reads the fold tool's result
         );
         assert.equal(out.text, "the answer is SEARCHED");
         assert.deepEqual(compactionsOf(h, sid).map((c) => c.summary), ["[work folded] 1 tool call: search"]);
-        const history = env.core.sessions.history(await env.core.sessions.ensure("toto", sid));
+        const entry = await env.core.sessions.ensure("toto", sid);
+        const history = env.core.sessions.history(entry);
         assert.deepEqual(
             history.map((m) => [m.role, m.content]),
             [
-                ["user", "go"],
+                ["user", `[${momentStamp(entry.events[0]!.createdAt)}]\ngo`],
                 ["assistant", "[work folded] 1 tool call: search"],
                 ["assistant", "the answer is SEARCHED"],
             ],

@@ -12,6 +12,7 @@ import type {
 
 import type { AgentPeer } from "../registry/peer.ts";
 import type { Registry } from "../registry/registry.ts";
+import { momentStamp } from "./prompt.ts";
 
 export interface CacheEntry {
     agent: string;
@@ -24,7 +25,7 @@ export interface CacheEntry {
     complete: boolean;
     bytes: number;
     touchedAt: number;
-    /** Memo of foldEvents(events); dropped whenever `events` changes. */
+    /** Memo of folded(): foldEvents(events) with the user lines stamped; dropped whenever `events` changes. */
     projection: FoldedEntry[] | null;
 }
 
@@ -164,8 +165,25 @@ export class SessionCache {
         return [...this.map.values()].filter((e) => e.agent === agent).map((e) => e.session);
     }
 
+    /**
+     * What every model-facing read of a session works from (the prompt, both compactions): the fold,
+     * each user line opened by the time its event was stored, so "tomorrow" in a message from last
+     * week reads as last week's. Stored times make the stamps byte-identical turn to turn (the
+     * provider's prompt cache holds); the log keeps no stamp, and the app reads `events`, never this.
+     */
     folded(entry: CacheEntry): FoldedEntry[] {
-        entry.projection ??= foldEvents(entry.events);
+        if (entry.projection) return entry.projection;
+        const times = new Map(entry.events.map((ev) => [ev.seq, ev.createdAt]));
+        entry.projection = foldEvents(entry.events).map((e) => {
+            const at = times.get(e.seq);
+            // the user's lines only: a stamped assistant line teaches a model to write stamps itself.
+            // A summary is an assistant line too, whatever seq it anchors at; and a time that is no
+            // real date (the log is read as the agent wrote it) leaves its line unstamped
+            if (e.message.role !== "user" || typeof at !== "number" || Number.isNaN(new Date(at).getTime())) return e;
+            const stamp = `[${momentStamp(at)}]`;
+            // images alone still happened at a time: the stamp is then the whole text
+            return { ...e, message: { ...e.message, content: e.message.content ? `${stamp}\n${e.message.content}` : stamp } };
+        });
         return entry.projection;
     }
 
