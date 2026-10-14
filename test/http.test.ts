@@ -5,12 +5,13 @@ import assert from "node:assert/strict";
 import { request as rawRequest } from "node:http";
 import test from "node:test";
 
-import type { EventBody, Message, MessageMeta } from "@mimi-os/protocol";
+import { FLAG_DATA, FLAG_END, type EventBody, type Message, type MessageMeta } from "@mimi-os/protocol";
 import type { FakeAgentOptions } from "@mimi-os/sdk/testing";
 
 import { momentStamp } from "../src/turn/prompt.ts";
 import type { Harness } from "./agent-harness.ts";
-import { boot, callTurn, textTurn, waitFor, type Env } from "./harness-env.ts";
+import { rawSession } from "./channel-client.ts";
+import { activeDevice, boot, callTurn, textTurn, waitFor, type Env } from "./harness-env.ts";
 
 async function connected(env: Env, opts: FakeAgentOptions): Promise<Harness> {
     const h = await env.connect(opts);
@@ -846,6 +847,118 @@ test("history: a payload written past the SDK is narrowed by the projection, nev
         assert.equal("meta" in items[4]!, false, "an unknown actor kind leaves the author unknown");
         // the malformed compaction and the two malformed cuts are dropped, never dereferenced
         assert.equal(items.length, 5, "a payload-less row is skipped, and no bad cut hides a real one");
+    } finally {
+        await env.stop();
+    }
+});
+
+const photo = (n: number, size = 40): string => `data:image/png;base64,${String(n).padStart(size, "A")}`;
+const photos = (from: number, count: number, size?: number): string[] => Array.from({ length: count }, (_v, i) => photo(from + i, size));
+
+test("history rows carry how many images a message has; the pixels come from the message's own image route", async () => {
+    const env = await boot();
+    try {
+        const h = await connected(env, { name: "toto", tools: [], handlers: {} });
+        const sid = h.createSession();
+        // seqs 1-5 carry 16 images each: 80, so the oldest is past the 64 the gateway holds
+        for (let m = 0; m < 5; m++) h.append(sid, [{ type: "message", payload: { role: "user", content: `m${m}`, images: photos(m * 100, 16, 2_000) } }]);
+        h.append(sid, [{ type: "message", payload: { role: "assistant", content: "seen" } }]);
+        const path = `/api/agents/toto/conversations/${sid}/messages`;
+
+        const history = await env.api<{ items: Array<{ id: number; images?: unknown }> }>("GET", path);
+        assert.deepEqual(history.json.items.map((m) => [m.id, m.images]), [[1, 16], [2, 16], [3, 16], [4, 16], [5, 16], [6, undefined]]);
+        assert.ok(history.bytes.length < 4_000, "the rows are small however big the images");
+
+        const held = env.core.sessions.entry("toto", sid)!;
+        assert.equal(held.pixels.has(1), false);
+        const asked = (): number => h.frames().filter((f) => f["type"] === "events_after").length;
+        const before = asked();
+        const newest = await env.api<{ images: string[] }>("GET", `${path}/5/images`);
+        assert.equal(newest.status, 200);
+        assert.deepEqual(newest.json.images, photos(400, 16, 2_000));
+        assert.equal(asked(), before, "a held message is served from the gateway");
+        const oldest = await env.api<{ images: string[] }>("GET", `${path}/1/images`);
+        assert.deepEqual(oldest.json.images, photos(0, 16, 2_000));
+        assert.equal(asked(), before + 1, "one that is not held is read back from the agent, one event");
+        assert.equal(held.pixels.has(1), false, "and the read does not grow what the cache holds");
+
+        assert.equal((await env.api("GET", `${path}/6/images`)).status, 404, "a message without images");
+        assert.equal((await env.api("GET", `${path}/99/images`)).status, 404);
+        // edited behind the chain: refused rather than served
+        (h.sessions.get(sid)!.events[0]!.payload as Message).images = photos(900, 16, 2_000);
+        const edited = await env.api<{ error: string }>("GET", `${path}/1/images`);
+        assert.equal(edited.status, 503);
+        assert.match(edited.json.error, /does not match the hash/);
+
+        h.close();
+        await waitFor(() => env.core.registry.get("toto") === undefined, 4000, "toto gone");
+        assert.equal((await env.api("GET", `${path}/5/images`)).status, 503, "the agent is down");
+    } finally {
+        await env.stop();
+    }
+});
+
+test("the image route reads back from agents two messages at a time across the gateway; the rest wait their turn", async (t) => {
+    const env = await boot();
+    try {
+        const h = await connected(env, { name: "toto", tools: [], handlers: {} });
+        const sid = h.createSession();
+        for (let m = 0; m < 9; m++) h.append(sid, [{ type: "message", payload: { role: "user", content: `m${m}`, images: photos(m * 100, 16) } }]);
+        await env.core.sessions.ensure("toto", sid);
+        const peer = env.core.registry.get("toto")!;
+        const request = peer.request.bind(peer) as (type: string, payload: unknown, opts?: unknown) => Promise<unknown>;
+        let inFlight = 0;
+        let most = 0;
+        const counted = async (type: string, payload: unknown, opts?: unknown): Promise<unknown> => {
+            if (type !== "events_after" || (payload as { limit?: number }).limit !== 1) return request(type, payload, opts);
+            inFlight++;
+            most = Math.max(most, inFlight);
+            await new Promise((r) => setTimeout(r, 30));
+            try {
+                return await request(type, payload, opts);
+            } finally {
+                inFlight--;
+            }
+        };
+        t.mock.method(peer, "request", counted as unknown as typeof peer.request);
+
+        // seqs 1-5 are past the 64 held: five read-backs asked at once
+        const replies = await Promise.all([1, 2, 3, 4, 5].map((seq) => env.api<{ images: string[] }>("GET", `/api/agents/toto/conversations/${sid}/messages/${seq}/images`)));
+        assert.deepEqual(replies.map((r) => r.status), [200, 200, 200, 200, 200]);
+        assert.deepEqual(replies.map((r) => r.json.images[0]), [0, 100, 200, 300, 400].map((n) => photo(n)));
+        assert.equal(most, 2);
+    } finally {
+        await env.stop();
+    }
+});
+
+test("the image route writes a full message one image at a time and waits out a device that stops reading", { timeout: 30_000 }, async () => {
+    const env = await boot();
+    try {
+        const h = await connected(env, { name: "toto", tools: [], handlers: {} });
+        const sid = h.createSession();
+        // 32 images of 480 000 chars: about 15 MB in one reply
+        const full = photos(0, 32, 480_000 - 22);
+        h.append(sid, [{ type: "message", payload: { role: "user", content: "", images: full } }]);
+        const { s } = await activeDevice(env, "phone");
+        const live = await rawSession(env, s);
+        assert.ok(live);
+        const path = `/api/agents/toto/conversations/${sid}/messages/1/images`;
+        live.send(1, FLAG_DATA, new TextEncoder().encode(JSON.stringify({ t: "api", method: "GET", path, headers: {} })));
+        live.send(1, FLAG_END);
+        const head = await live.frame(1, 10_000);
+        assert.equal(JSON.parse(Buffer.from(head!.payload).toString("utf8")).status, 200);
+        live.pause();
+        await new Promise((r) => setTimeout(r, 300));
+        live.ws.resume();
+        const body: Buffer[] = [];
+        for (;;) {
+            const frame = await live.frame(1, 10_000);
+            assert.ok(frame, "the stream was not cut");
+            body.push(Buffer.from(frame.payload));
+            if (frame.flags === FLAG_END) break;
+        }
+        assert.deepEqual(JSON.parse(Buffer.concat(body).toString("utf8")), { images: full });
     } finally {
         await env.stop();
     }

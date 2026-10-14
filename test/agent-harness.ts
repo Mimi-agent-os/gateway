@@ -51,6 +51,8 @@ export interface Harness {
     close(): void;
 }
 
+const PAGE_BYTES = 512 * 1024;
+
 const stored = (b: EventBody, seq: number, hash: string, createdAt: number): StoredEvent => {
     if (b.type === "message") return { type: "message", payload: b.payload, seq, hash, createdAt };
     if (b.type === "compaction") return { type: "compaction", payload: b.payload, seq, hash, createdAt };
@@ -140,8 +142,16 @@ export function createHarness(opts: HarnessOptions, gatewayPub: Uint8Array): Har
                     const after = Number(p["afterSeq"] ?? 0);
                     const limit = Math.max(1, Math.min(1000, Number(p["limit"] ?? 1000)));
                     const rows = s.events.filter((e) => e.seq > after);
-                    const page = rows.slice(0, limit);
-                    answer(id, type, { events: page, head: head(sid), more: rows.length > limit });
+                    // the SDK's paging: at least one event, and none that would carry the page past 512 KiB
+                    const page: StoredEvent[] = [];
+                    let bytes = 0;
+                    for (const row of rows.slice(0, limit)) {
+                        const size = Buffer.byteLength(JSON.stringify(row));
+                        if (page.length && bytes + size > PAGE_BYTES) break;
+                        page.push(row);
+                        bytes += size;
+                    }
+                    answer(id, type, { events: page, head: head(sid), more: rows.length > page.length });
                     return;
                 }
                 case "append": {

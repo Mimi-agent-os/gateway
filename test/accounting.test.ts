@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import { IMAGE_TOKENS } from "@mimi-os/protocol";
 import type { EventBody, Message, Tool } from "@mimi-os/protocol";
 import { runAgent } from "@mimi-os/sdk";
 import { fakeAgentSocket, fakeIdentity, type ScriptedTurn } from "@mimi-os/sdk/testing";
@@ -471,7 +472,7 @@ test("title, compaction and a model check the provider had are estimated when it
     }
 });
 
-test("an estimate leaves out only the images a message carries, never a tool parameter of that name", () => {
+test("an estimate counts each image as IMAGE_TOKENS, never its base64, and never a tool parameter of that name", () => {
     const slides = (key: string): Tool => ({
         type: "function",
         function: { name: "make_slides", parameters: { type: "object", properties: { [key]: { type: "array", description: "d".repeat(4_000) } } } },
@@ -479,8 +480,11 @@ test("an estimate leaves out only the images a message carries, never a tool par
     const ask: Message[] = [{ role: "user", content: "make slides", images: [`data:image/png;base64,${"A".repeat(40_000)}`] }];
     const named = estimateUsage(ask, [slides("images")], "").promptTokens;
     assert.equal(named, estimateUsage(ask, [slides("photos")], "").promptTokens);
-    assert.ok(named > 1_000, "the parameter's schema is in the prompt");
-    assert.equal(estimateUsage(ask, [], "").promptTokens, estimateUsage([{ role: "user", content: "make slides" }], [], "").promptTokens);
+    assert.ok(named - IMAGE_TOKENS > 1_000, "the parameter's schema is in the prompt");
+    // an image costs the window IMAGE_TOKENS, never its base64 length
+    assert.equal(estimateUsage(ask, [], "").promptTokens, estimateUsage([{ role: "user", content: "make slides" }], [], "").promptTokens + IMAGE_TOKENS);
+    const album: Message[] = [{ role: "user", content: "", images: Array.from({ length: 32 }, () => "data:image/png;base64,QUJD") }];
+    assert.equal(estimateUsage(album, [], "").promptTokens, estimateUsage([{ role: "user", content: "" }], [], "").promptTokens + 32 * IMAGE_TOKENS);
 });
 
 test("a call stopped while it waits in the queue never reached the provider and spends nothing", async () => {

@@ -1,9 +1,13 @@
 /** The session cache: the HEAD check, a delta against a full reload, and integrity on every read. */
+import "./pq-home.ts";
+
 import assert from "node:assert/strict";
 import test from "node:test";
 
 import type { EventBody, Message } from "@mimi-os/protocol";
+import { addModel, setDefaultModel } from "../src/llm/models.ts";
 import { momentStamp } from "../src/turn/prompt.ts";
+import { HELD_IMAGES, IMAGE_NOT_SHOWN } from "../src/turn/sessions.ts";
 import { boot, callTurn, drained, textTurn, waitFor } from "./harness-env.ts";
 import type { Env } from "./harness-env.ts";
 import type { Harness } from "./agent-harness.ts";
@@ -18,6 +22,21 @@ async function connected(env: Env, name: string): Promise<Harness> {
     await waitFor(() => env.core.registry.get(name) !== undefined, 4000, "registration");
     return h;
 }
+
+/** A distinct data-URI of `size` base64 chars, told apart by `n`. */
+const img = (n: number, size = 40): string => `data:image/png;base64,${String(n).padStart(size, "A")}`;
+const album = (from: number, count: number, size?: number): string[] => Array.from({ length: count }, (_v, i) => img(from + i, size));
+const pictured = (content: string, images: string[]): EventBody => ({ type: "message", payload: { role: "user", content, images } });
+const sortedKeys = (map: Map<number, unknown>): number[] => [...map.keys()].sort((a, b) => a - b);
+
+/** The events_after requests the gateway made, as sent. */
+const pagesOf = (h: Harness): Array<{ afterSeq: number; limit: number }> =>
+    h.frames()
+        .filter((f) => f["type"] === "events_after")
+        .map((f) => {
+            const { afterSeq, limit } = f["payload"] as { afterSeq: number; limit: number };
+            return { afterSeq, limit };
+        });
 
 const afterSeqsOf = (h: Harness): number[] =>
     h.frames()
@@ -326,7 +345,7 @@ test("an event canon() refuses to hash breaks the chain instead of killing the s
 
 test("a log that pages out of pages is kept as a prefix and never served as history", async (t) => {
     // a cache too small to hold the prefix: eviction must not restart the read from seq 0 forever
-    const env = await boot({ cache: { maxBytes: 1 } });
+    const env = await boot({ cache: { maxBytes: 1, maxPages: 200 } });
     try {
         const h = await connected(env, "toto");
         const sid = h.createSession();
@@ -356,6 +375,216 @@ test("a log that pages out of pages is kept as a prefix and never served as hist
         assert.equal(full.headSeq, h.sessions.get(sid)!.headSeq);
         assert.equal(full.headHash, h.sessions.get(sid)!.headHash);
         assert.equal(env.core.sessions.history(full).at(-1)?.content, `[${momentStamp(full.events.at(-1)!.createdAt)}]\nm449`);
+    } finally {
+        await env.stop();
+    }
+});
+
+test("a message's images leave the cached log once the chain has checked them, and the newest are held as pixels", async () => {
+    const env = await boot();
+    try {
+        const h = await connected(env, "toto");
+        const sid = h.createSession();
+        const photos = album(1, 2);
+        h.append(sid, [
+            pictured("what is this?", photos),
+            msg("assistant", "two cats"),
+            pictured("and this", ["https://tracker.example/pixel.png"]),
+        ]);
+        const entry = await env.core.sessions.ensure("toto", sid);
+        assert.equal(entry.events.some((e) => "images" in (e.payload as object)), false, "no cached payload keeps its images");
+        assert.deepEqual([...entry.images], [[1, 2]], "a remote URL is no image and is not counted");
+        assert.deepEqual([...entry.pixels], [[1, photos]]);
+        assert.ok(entry.bytes > photos.join("").length, "the pixels are charged to the entry");
+        assert.equal(env.logs.filter((l) => l.includes("INTEGRITY")).length, 0, "the chain was checked on the whole payloads");
+
+        const first = env.core.sessions.history(entry)[0]!;
+        assert.deepEqual(first.images, photos);
+        assert.equal(first.content, `[${momentStamp(entry.events[0]!.createdAt)}]\nwhat is this?`);
+        assert.deepEqual(h.sessions.get(sid)!.events[0]!.payload, { role: "user", content: "what is this?", images: photos }, "the agent's log is untouched");
+    } finally {
+        await env.stop();
+    }
+});
+
+test("the cache holds the newest undescribed visible images, whole messages, at most HELD_IMAGES; older ones read as a marker until described", async () => {
+    const env = await boot();
+    try {
+        const h = await connected(env, "toto");
+        const sid = h.createSession();
+        // five messages of 20 images at seqs 1, 3, 5, 7, 9: 100 undescribed, three messages held
+        for (let m = 0; m < 5; m++) h.append(sid, [pictured(`batch ${m}`, album(m * 100, 20)), msg("assistant", `seen ${m}`)]);
+        const entry = await env.core.sessions.ensure("toto", sid);
+        assert.equal(HELD_IMAGES, 64);
+        assert.deepEqual(sortedKeys(entry.pixels), [5, 7, 9]);
+        assert.deepEqual([...env.core.sessions.undescribed(entry)], [[1, 20], [3, 20], [5, 20], [7, 20], [9, 20]]);
+        let users = env.core.sessions.history(entry).filter((m) => m.role === "user");
+        assert.deepEqual(users.map((m) => m.images?.length ?? 0), [0, 0, 20, 20, 20]);
+        assert.equal(users[0]!.content!.split("\n").filter((l) => l === IMAGE_NOT_SHOWN).length, 20, "one marker per image not held");
+        assert.ok(users[0]!.content!.startsWith(`[${momentStamp(entry.events[0]!.createdAt)}]\nbatch 0\n`));
+
+        // the two newest are described: the window moves back over the older ones, read again from the agent
+        const asked = pagesOf(h).length;
+        const notes = (what: string): string[] => Array.from({ length: 20 }, (_v, i) => `${what} ${i}`);
+        h.append(sid, [{ type: "compaction", payload: { images: [{ seq: 7, notes: notes("a cat") }, { seq: 9, notes: notes("a dog") }] } }]);
+        const moved = await env.core.sessions.ensure("toto", sid);
+        assert.deepEqual(sortedKeys(moved.pixels), [1, 3, 5]);
+        assert.deepEqual(pagesOf(h).slice(asked), [
+            { afterSeq: 10, limit: 500 },
+            { afterSeq: 2, limit: 1 },
+            { afterSeq: 0, limit: 1 },
+        ], "the delta, then each missing message on its own, newest first");
+        users = env.core.sessions.history(moved).filter((m) => m.role === "user");
+        assert.deepEqual(users.map((m) => m.images?.length ?? 0), [20, 20, 20, 0, 0]);
+        assert.deepEqual(users[0]!.images, album(0, 20));
+        assert.ok(users[3]!.content!.endsWith(notes("a cat").map((n) => `[earlier image: ${n}]`).join("\n")));
+        assert.equal(users.some((m) => m.content?.includes(IMAGE_NOT_SHOWN)), false);
+        assert.deepEqual([...env.core.sessions.undescribed(moved).keys()], [1, 3, 5]);
+    } finally {
+        await env.stop();
+    }
+});
+
+test("an image read back from the agent must match the hash the cache checked; a held one is served without a read", async () => {
+    const env = await boot();
+    try {
+        const h = await connected(env, "toto");
+        const sid = h.createSession();
+        for (let m = 0; m < 5; m++) h.append(sid, [pictured(`batch ${m}`, album(m * 100, 20))]);
+        const entry = await env.core.sessions.ensure("toto", sid);
+        assert.deepEqual(sortedKeys(entry.pixels), [3, 4, 5]);
+
+        // the agent's copy edited behind the chain: the bytes no longer match what was checked
+        const row = h.sessions.get(sid)!.events[0]!;
+        (row as { payload: unknown }).payload = { role: "user", content: "batch 0", images: album(999, 20) };
+        await assert.rejects(env.core.sessions.images(entry, 1), /does not match the hash the gateway checked/);
+        assert.deepEqual(await env.core.sessions.images(entry, 2), album(100, 20));
+        const asked = pagesOf(h).length;
+        assert.equal(await env.core.sessions.images(entry, 5), entry.pixels.get(5), "held: the very array, no request");
+        assert.equal(pagesOf(h).length, asked);
+        await assert.rejects(env.core.sessions.images(entry, 99), /not in the cached log/);
+    } finally {
+        await env.stop();
+    }
+});
+
+test("a cold load checks the chain and strips the images page by page, one image message per page past 512 KiB", async () => {
+    const env = await boot();
+    try {
+        const h = await connected(env, "toto");
+        const sid = h.createSession();
+        for (let m = 0; m < 4; m++) h.append(sid, [pictured(`photo ${m}`, [img(m, 400_000)]), msg("assistant", `ok ${m}`)]);
+        const entry = await env.core.sessions.ensure("toto", sid);
+        assert.deepEqual(afterSeqsOf(h), [0, 2, 4, 6], "a page per image message");
+        assert.equal(entry.events.length, 8);
+        assert.equal(env.logs.filter((l) => l.includes("INTEGRITY")).length, 0);
+        assert.deepEqual(sortedKeys(entry.pixels), [1, 3, 5, 7], "every image is in the window, none read twice");
+        assert.ok(entry.bytes < 4 * 400_000 + 8_000, "the cached log itself is small");
+
+        // an image edited in place breaks the chain at its seq, on a cold read across pages
+        (h.sessions.get(sid)!.events[4]!.payload as Message).images = [img(77, 400_000)];
+        env.core.sessions.drop("toto", sid);
+        env.logs.length = 0;
+        await env.core.sessions.ensure("toto", sid);
+        assert.ok(env.logs.some((l) => l.includes("INTEGRITY") && l.includes("seq 5")), env.logs.join(""));
+    } finally {
+        await env.stop();
+    }
+});
+
+test("over the byte budget an idle chat sheds its pixels before it is evicted, and reads them back when opened again", async () => {
+    const env = await boot({ cache: { maxBytes: 1_000_000 } });
+    try {
+        const h = await connected(env, "toto");
+        const a = h.createSession();
+        const big = [img(1, 400_000), img(2, 400_000)];
+        h.append(a, [pictured("big", big), msg("assistant", "ok")]);
+        assert.equal((await env.core.sessions.ensure("toto", a)).pixels.size, 1);
+
+        const b = h.createSession();
+        h.append(b, [pictured("small", [img(3, 300_000)])]);
+        await env.core.sessions.ensure("toto", b);
+        const idle = env.core.sessions.entry("toto", a);
+        assert.ok(idle, "the idle chat is still cached");
+        assert.equal(idle.pixels.size, 0, "but its pixels went first");
+        assert.ok(idle.bytes < 10_000);
+
+        const asked = pagesOf(h).length;
+        const back = await env.core.sessions.ensure("toto", a);
+        assert.deepEqual(back.pixels.get(1), big);
+        assert.deepEqual(pagesOf(h).slice(asked), [{ afterSeq: 0, limit: 1 }], "only the held message is read back");
+        assert.equal(env.core.sessions.entry("toto", b)?.pixels.size, 0, "now the other one is idle");
+    } finally {
+        await env.stop();
+    }
+});
+
+test("a turn's own images go straight into the held pixels: no read back, the model gets them", async () => {
+    const env = await boot();
+    try {
+        addModel({ name: "eye", provider: "llamacpp", endpoint: env.model.url, contextTokens: 128_000, vision: true }, env.db);
+        setDefaultModel("eye", env.db);
+        const h = await connected(env, "toto");
+        const sid = h.createSession();
+        const photos = album(1, 3);
+        env.model.nextTurn(textTurn("three photos"));
+        await env.core.runTurn({ agent: "toto", session: sid, text: "look", images: photos, title: false });
+
+        const entry = env.core.sessions.entry("toto", sid)!;
+        assert.deepEqual(entry.pixels.get(1), photos);
+        assert.deepEqual([...entry.images], [[1, 3]]);
+        assert.equal(entry.events.some((e) => "images" in (e.payload as object)), false);
+        assert.deepEqual(afterSeqsOf(h), [0], "the turn's own writes cost no extra fetch");
+        const user = (env.model.requests[0]!["messages"] as Array<{ role: string; content: unknown }>).find((m) => m.role === "user")!;
+        assert.equal((user.content as Array<{ type: string }>).filter((p) => p.type === "image_url").length, 3);
+    } finally {
+        await env.stop();
+    }
+});
+
+test("agent event reads are at most two in flight across the gateway: chats loading cold wait in line, and a cancelled one leaves it", async (t) => {
+    const env = await boot();
+    try {
+        const h = await connected(env, "toto");
+        const sids = Array.from({ length: 10 }, (_v, i) => {
+            const sid = h.createSession();
+            h.append(sid, [pictured(`chat ${i}`, album(i * 100, 4)), msg("assistant", "seen")]);
+            return sid;
+        });
+        const peer = env.core.registry.get("toto")!;
+        const request = peer.request.bind(peer) as (type: string, payload: unknown, opts?: unknown) => Promise<unknown>;
+        let inFlight = 0;
+        let most = 0;
+        const read: number[] = [];
+        const counted = async (type: string, payload: unknown, opts?: unknown): Promise<unknown> => {
+            if (type !== "events_after") return request(type, payload, opts);
+            read.push((payload as { session: number }).session);
+            inFlight++;
+            most = Math.max(most, inFlight);
+            await new Promise((r) => setTimeout(r, 20));
+            try {
+                return await request(type, payload, opts);
+            } finally {
+                inFlight--;
+            }
+        };
+        t.mock.method(peer, "request", counted as unknown as typeof peer.request);
+
+        const loads = sids.slice(0, 9).map((sid) => env.core.sessions.ensure("toto", sid));
+        await waitFor(() => inFlight === 2, 4000, "two reads in flight");
+        const abort = new AbortController();
+        const last = sids[9]!;
+        const left = env.core.sessions.ensure("toto", last, abort.signal);
+        await waitFor(() => h.frames().some((f) => f["type"] === "session_head" && (f["payload"] as { sessions: number[] }).sessions.includes(last)), 4000, "its head");
+        await new Promise((r) => setTimeout(r, 5));
+        abort.abort(new Error("the reader left"));
+        await assert.rejects(left, /the reader left/);
+
+        assert.deepEqual((await Promise.all(loads)).map((e) => e.pixels.size), Array(9).fill(1));
+        assert.equal(most, 2);
+        assert.equal(read.includes(last), false, "the cancelled load never read");
+        assert.equal((await env.core.sessions.ensure("toto", last)).headSeq, 2, "and the line moves on without it");
+        assert.equal(most, 2);
     } finally {
         await env.stop();
     }

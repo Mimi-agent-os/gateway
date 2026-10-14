@@ -1,8 +1,11 @@
 /** Deterministic fold: a `fold`-marked tool's traffic drops out of history even without `done`. */
+import "./pq-home.ts";
+
 import assert from "node:assert/strict";
 import test from "node:test";
 
 import type { CompactionPayload, EventBody } from "@mimi-os/protocol";
+import { addModel, setDefaultModel } from "../src/llm/models.ts";
 import { momentStamp } from "../src/turn/prompt.ts";
 import { boot, callTurn, textTurn, waitFor } from "./harness-env.ts";
 import type { Env } from "./harness-env.ts";
@@ -148,11 +151,47 @@ test("a `done` after a mid-turn compaction folds only what came after it: the co
         const comps = compactionsOf(h, sid);
         assert.deepEqual(comps.map((c) => c.summary), ["EARLIER SUMMARY", "[work folded] Wrapped up."]);
         const midTurn = h.sessions.get(sid)!.events.find((e) => e.type === "compaction")!.seq;
-        assert.ok(comps[1]!.covers[0] > midTurn, "the fold range starts after the compaction event");
+        assert.ok(comps[1]!.covers![0] > midTurn, "the fold range starts after the compaction event");
         const history = env.core.sessions.history(await env.core.sessions.ensure("toto", sid));
         assert.equal(history[0]?.content, "EARLIER SUMMARY", "the earlier conversation is still summarized");
         assert.ok(history.some((m) => m.content === "[work folded] Wrapped up."));
         assert.equal(history.at(-1)?.content, "finished");
+    } finally {
+        await env.stop();
+    }
+});
+
+test("an image fold before the first call leaves the turn's own tool run to fold as usual", async () => {
+    const env = await boot();
+    try {
+        addModel({ name: "eye", provider: "llamacpp", endpoint: env.model.url, contextTokens: 128_000, vision: true }, env.db);
+        setDefaultModel("eye", env.db);
+        const { h, sid } = await connected(env);
+        const photo = (n: number): string => `data:image/png;base64,${String(n).padStart(40, "A")}`;
+        // 26 undescribed: the newest 6 stay, the older 20 fold
+        h.append(sid, [
+            { type: "message", payload: { role: "user", content: "old", images: Array.from({ length: 20 }, (_v, i) => photo(i)) } },
+            { type: "message", payload: { role: "user", content: "new", images: Array.from({ length: 6 }, (_v, i) => photo(50 + i)) } },
+        ]);
+        const lines = (count: number): string => Array.from({ length: count }, (_v, i) => `${i + 1}: shot ${i + 1}`).join("\n");
+        env.model.nextTurn(textTurn(lines(8)));
+        env.model.nextTurn(textTurn(lines(8)));
+        env.model.nextTurn(textTurn(lines(4)));
+        env.model.nextTurn(callTurn([{ id: "s1", name: "search" }]));
+        env.model.nextTurn(textTurn("all done"));
+
+        await env.core.runTurn({ agent: "toto", session: sid, text: "go", title: false });
+
+        const comps = compactionsOf(h, sid);
+        assert.deepEqual(comps.map((c) => [c.summary, c.images?.map((i) => [i.seq, i.notes.length])]), [
+            [undefined, [[1, 20]]],
+            ["[work folded] 1 tool call: search", undefined],
+        ]);
+        const history = env.core.sessions.history(await env.core.sessions.ensure("toto", sid));
+        assert.ok(history[0]?.content?.endsWith("[earlier image: shot 4]"));
+        assert.equal(history[1]?.images?.length, 6);
+        assert.equal(history.at(-1)?.content, "all done");
+        assert.equal(history.some((m) => m.content === "SEARCHED"), false, "the tool traffic is folded away");
     } finally {
         await env.stop();
     }

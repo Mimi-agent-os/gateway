@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import { createServer, type Server } from "node:http";
 import test from "node:test";
 
+import { MAX_IMAGE_BYTES, MAX_IMAGES } from "@mimi-os/protocol";
 import type { Message } from "@mimi-os/protocol";
 import { createFakeModel, type FakeModel } from "@mimi-os/sdk/testing";
 
@@ -51,11 +52,11 @@ async function endpoint(status: number, sse = ""): Promise<{ url: string; hits: 
     };
 }
 
-/** "seer" is the one model that sees images; the policy sits on the pin before the handshake. */
+/** "seer" is the one model that sees images, with a window that takes a full message of them; the policy sits on the pin before the handshake. */
 async function withSeer(env: Env, policy: ModelsPolicy, seerUrl?: string): Promise<{ h: Harness; seer: FakeModel }> {
     const seer = createFakeModel();
     const url = await seer.listen();
-    addModel({ name: "seer", provider: "llamacpp", endpoint: seerUrl ?? url, contextTokens: 1000, vision: true }, env.db);
+    addModel({ name: "seer", provider: "llamacpp", endpoint: seerUrl ?? url, contextTokens: 128_000, vision: true }, env.db);
     env.pin("toto");
     env.db.setModelsPolicy("toto", policy);
     const h = await env.connect({ name: "toto", tools: [], handlers: {} }, false);
@@ -258,36 +259,40 @@ test("a one-shot with images falls back to a text-only model only when the prima
     }
 });
 
-test("POST …/messages takes only inline images within the wire contract, in a body of about 1 MB", async () => {
+test("POST …/messages takes 32 inline images of at most 480 000 bytes each, and a megabyte of text", { timeout: 30_000 }, async () => {
     const env = await boot();
     const { h, seer } = await withSeer(env, { allowed: ["fake", "seer"], primary: "seer" });
     try {
         const sid = h.createSession();
         const path = `/api/agents/toto/conversations/${sid}/messages`;
-        const big = `data:image/jpeg;base64,${"A".repeat(190_000)}`;
-        const refused = [
-            ["https://tracker.example/pixel.png"],
-            ["data:image/svg+xml;base64,PHN2Zz4="],
-            [PNG, PNG, PNG, PNG, PNG],
-            [big, big, big, big],
+        const full = `data:image/jpeg;base64,${"A".repeat(MAX_IMAGE_BYTES - 23)}`;
+        assert.equal(full.length, MAX_IMAGE_BYTES);
+        const over = `data:image/jpeg;base64,${"A".repeat(MAX_IMAGE_BYTES - 22)}`;
+        const refused: Array<[unknown, RegExp]> = [
+            [{ text: "look", images: ["https://tracker.example/pixel.png"] }, /data URIs/],
+            [{ text: "look", images: ["data:image/svg+xml;base64,PHN2Zz4="] }, /data URIs/],
+            [{ text: "look", images: Array.from({ length: MAX_IMAGES + 1 }, () => PNG) }, /at most 32 images/],
+            [{ text: "look", images: [PNG, over] }, /each image must be at most 480000 bytes/],
+            [{ text: "é".repeat(500_001) }, /text of one message must be at most 1000000 bytes/],
+            [{ text: "x", images: Array.from({ length: MAX_IMAGES }, () => full), pad: "x".repeat(1_100_000) }, /body too large/],
         ];
-        const errors: string[] = [];
-        for (const images of refused) {
-            const r = await env.api<{ error?: string }>("POST", path, { text: "look", images });
-            assert.equal(r.status, 400, images[0]!.slice(0, 40));
-            errors.push(String(r.json.error));
+        for (const [body, error] of refused) {
+            const r = await env.api<{ error?: string }>("POST", path, body);
+            assert.equal(r.status, 400, String(error));
+            assert.match(String(r.json.error), error);
         }
-        assert.match(errors[2]!, /at most 4 images/);
-        assert.match(errors[3]!, /total at most 750000 bytes/);
-        assert.equal((await env.api("POST", path, { text: "x".repeat(1_100_000) })).status, 400, "the body limit");
         assert.equal(seer.requests.length, 0);
         assert.equal(h.sessions.get(sid)!.events.length, 0, "nothing refused was stored");
 
-        seer.nextTurn(textTurn("four photos"));
-        const turn = await env.stream("POST", path, { text: "look", images: [big, big, big, PNG] });
+        seer.nextTurn(textTurn("thirty-two photos"));
+        const album = Array.from({ length: MAX_IMAGES }, (_, i) => `${full.slice(0, -4)}${String(i).padStart(4, "0")}`);
+        const turn = await env.stream("POST", path, { text: "y".repeat(900_000), images: album });
         assert.equal(turn.status, 200);
         await turn.done;
-        assert.deepEqual((h.sessions.get(sid)!.events[0]!.payload as Message).images, [big, big, big, PNG]);
+        assert.equal(turn.lines.at(-1)?.["answer"], "thirty-two photos");
+        assert.deepEqual((h.sessions.get(sid)!.events[0]!.payload as Message).images, album);
+        const parts = sentMessages(seer, 0).find((m) => m.role === "user")!.content as Array<{ type: string }>;
+        assert.equal(parts.filter((p) => p.type === "image_url").length, MAX_IMAGES, "every image reached the model");
     } finally {
         await seer.close();
         await env.stop();
@@ -309,11 +314,14 @@ test("images alone are a message: a vision model gets only image parts, the hist
             { type: "text", text: stampOf(env, sid, 1) },
             { type: "image_url", image_url: { url: PNG } },
         ]);
-        const history = await env.api<{ items: { role: string; content: string; images?: string[] }[] }>("GET", path);
+        // the history names how many; the pixels are a request of their own
+        const history = await env.api<{ items: { role: string; content: string; images?: number }[] }>("GET", path);
         assert.deepEqual(history.json.items.map((m) => [m.role, m.content, m.images]), [
-            ["user", "", [PNG]],
+            ["user", "", 1],
             ["assistant", "a cat", undefined],
         ]);
+        const pixels = await env.api<{ images: string[] }>("GET", `${path}/1/images`);
+        assert.deepEqual(pixels.json, { images: [PNG] });
 
         env.model.nextTurn(textTurn("still a cat"));
         await env.core.runTurn({ agent: "toto", session: sid, text: "and now?", model: "fake", title: false });

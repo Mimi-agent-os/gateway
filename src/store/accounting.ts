@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
 
+import { IMAGE_TOKENS } from "@mimi-os/protocol";
 import type { Message, SessionId, Tool, Usage } from "@mimi-os/protocol";
 
 import { localDay } from "./day.ts";
@@ -57,11 +58,12 @@ export function setUsageRecordedHook(db: GatewayDb, fn: ((agent: string) => void
     else usageRecordedHooks.delete(db);
 }
 
-/** chars/4 of what was sent (images left out) and of what streamed back, for a call the provider
- *  had but never reported: stopped, failed, or a server that sends no usage. */
+/** chars/4 of what was sent, IMAGE_TOKENS for each image, and chars/4 of what streamed back, for a
+ *  call the provider had but never reported: stopped, failed, or a server that sends no usage. */
 export function estimateUsage(messages: readonly Message[], tools: readonly Tool[], output: string): Usage {
     const sent = JSON.stringify({ messages: messages.map(({ images: _images, ...m }) => m), tools });
-    const promptTokens = Math.ceil(sent.length / CHARS_PER_TOKEN);
+    const images = messages.reduce((n, m) => n + (m.images?.length ?? 0), 0);
+    const promptTokens = Math.ceil(sent.length / CHARS_PER_TOKEN) + images * IMAGE_TOKENS;
     const completionTokens = Math.ceil(output.length / CHARS_PER_TOKEN);
     return { promptTokens, completionTokens, totalTokens: promptTokens + completionTokens, cachedTokens: 0 };
 }

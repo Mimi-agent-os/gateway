@@ -155,12 +155,24 @@ const BODY_MAX = 1_000_000;
 /** A body the client got wrong — the dispatcher answers it 400 for every route that reads one. */
 class BodyError extends Error {}
 
-/** `max` overrides the 1 MB default for the few routes that carry bulk (image data-URIs on a turn). */
-export function readBody(req: IncomingMessage, max = BODY_MAX): Promise<Record<string, unknown>> {
+/** `max` overrides the 1 MB default for the few routes that carry bulk (image data-URIs on a turn);
+ *  `idleMs` drops a body that sends nothing for that long. */
+export function readBody(req: IncomingMessage, max = BODY_MAX, idleMs?: number): Promise<Record<string, unknown>> {
     return new Promise((resolve, reject) => {
         let size = 0;
         const chunks: Buffer[] = [];
+        let idle: NodeJS.Timeout | undefined;
+        const rearm = (): void => {
+            clearTimeout(idle);
+            if (idleMs === undefined) return;
+            idle = setTimeout(() => {
+                reject(new BodyError("the body stopped arriving"));
+                req.destroy();
+            }, idleMs);
+        };
+        rearm();
         req.on("data", (c: Buffer) => {
+            rearm();
             size += c.length;
             if (size > max) {
                 reject(new BodyError("body too large"));
@@ -170,6 +182,7 @@ export function readBody(req: IncomingMessage, max = BODY_MAX): Promise<Record<s
             chunks.push(c);
         });
         req.on("end", () => {
+            clearTimeout(idle);
             try {
                 const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
                 if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
@@ -181,6 +194,11 @@ export function readBody(req: IncomingMessage, max = BODY_MAX): Promise<Record<s
             }
         });
         req.on("error", reject);
+        // a body cut off without an error event would leave its reader waiting for good
+        req.on("close", () => {
+            clearTimeout(idle);
+            reject(new BodyError("the body ended before it was complete"));
+        });
     });
 }
 

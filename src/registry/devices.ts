@@ -19,6 +19,7 @@ import {
     ServerSession,
     gatewayId,
     makeInviteUri,
+    MAX_AGENT_MESSAGE_BYTES,
     newInvite,
     noPerms,
     PROTOCOL_VERSION,
@@ -59,7 +60,7 @@ export interface DeviceServiceOptions {
     /** Every channel connection at any stage, and the sessions one device key may hold at once. */
     maxSessions?: number;
     maxDeviceSessions?: number;
-    /** Accept to ready/enrollment, and the same ceiling for one half-sent stream-0 message. */
+    /** Accept to ready/enrollment, and the same ceiling for one half-sent device stream-0 message. */
     preauthDeadlineMs?: number;
     /** How long a connection may stay over its queued-bytes watermark before the socket is dropped. */
     streamStallMs?: number;
@@ -90,9 +91,12 @@ const MAX_STREAM_QUEUED = 256 * 1024;
 const EPOCH_EVERY_MS = 60_000;
 const APPROVE_MODE_KEY = "device_approve_mode";
 const OP_KINDS = new Set(["devices.list", "devices.approve", "devices.reject", "devices.revoke"]);
-/** One or more DATA frames per stream-0 message, the assembled ceiling — the SDK's channel holds
- *  the same line, and closes the whole session on a message over it. */
+/** One or more DATA frames per device stream-0 message (control only), the assembled ceiling. An
+ *  agent session's messages carry MAX_AGENT_MESSAGE_BYTES instead: the SDK's channel holds that
+ *  line, and closes the whole session on a message over it. */
 export const MAX_STREAM0_BYTES = 1_048_576;
+/** One half-sent agent message may park its buffers this long: a full one then needs about 4.5 Mbit/s. */
+const AGENT_MESSAGE_DEADLINE_MS = 30_000;
 /** Every frame of a message costs at least this much of that ceiling, so a trickle of empty frames
  *  cannot grow the reassembly for free. */
 const STREAM0_FRAME_COST = 64;
@@ -163,7 +167,7 @@ interface Conn {
     stall: NodeJS.Timeout | null;
     /** Stream-0 message reassembly, shared by device control and the agent adapter. */
     msgPieces: Buffer[];
-    /** What the message in flight has charged against MAX_STREAM0_BYTES, not its byte length. */
+    /** What the message in flight has charged against its role's ceiling, not its byte length. */
     msgBytes: number;
     msgTimer: NodeJS.Timeout | null;
     agentAdapter: AgentSocket | null;
@@ -805,9 +809,9 @@ export class DeviceService {
                 // the agent would drop the whole session on it, and every request in flight there:
                 // refused here, only the request that carries it fails
                 const bytes = Buffer.byteLength(text, "utf8");
-                if (bytes > MAX_STREAM0_BYTES) {
+                if (bytes > MAX_AGENT_MESSAGE_BYTES) {
                     throw new Error(
-                        `a message of ${bytes} bytes is over the ${MAX_STREAM0_BYTES} one channel message carries`,
+                        `a message of ${bytes} bytes is over the ${MAX_AGENT_MESSAGE_BYTES} one channel message carries`,
                     );
                 }
                 this.#message(conn, text);
@@ -868,9 +872,10 @@ export class DeviceService {
         this.#message(conn, JSON.stringify(msg));
     }
 
-    /** Reassembles a stream-0 message: DATA frames accumulate, FLAG_END completes
-     *  it. Overflow past 1 MiB closes the session. */
+    /** Reassembles a stream-0 message: DATA frames accumulate, FLAG_END completes it. Overflow past
+     *  the role's ceiling (1 MiB for a device, 16 MiB for an agent) closes the session. */
     #stream0(conn: Conn, frame: ChannelStreamFrame, onMessage: (text: string) => void): void {
+        const agent = conn.role === "agent";
         const forget = (): void => {
             if (conn.msgTimer) clearTimeout(conn.msgTimer);
             conn.msgTimer = null;
@@ -883,7 +888,7 @@ export class DeviceService {
         }
         conn.msgPieces.push(Buffer.from(frame.payload));
         conn.msgBytes += Math.max(frame.payload.length, STREAM0_FRAME_COST);
-        if (conn.msgBytes > MAX_STREAM0_BYTES) {
+        if (conn.msgBytes > (agent ? MAX_AGENT_MESSAGE_BYTES : MAX_STREAM0_BYTES)) {
             forget();
             conn.sock.close(1009, "message too large");
             return;
@@ -891,7 +896,10 @@ export class DeviceService {
         if (frame.flags !== FLAG_END) {
             // the deadline runs from the message's FIRST frame: a trickle of frames must not renew
             // it, or a half-sent message parks its buffers for the life of the connection
-            conn.msgTimer ??= setTimeout(() => conn.sock.close(1009, "message stalled"), this.#deadlineMs).unref();
+            conn.msgTimer ??= setTimeout(
+                () => conn.sock.close(1009, "message stalled"),
+                agent ? AGENT_MESSAGE_DEADLINE_MS : this.#deadlineMs,
+            ).unref();
             return;
         }
         const joined = Buffer.concat(conn.msgPieces);

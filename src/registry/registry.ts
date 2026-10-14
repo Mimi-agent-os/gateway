@@ -159,7 +159,7 @@ function validateDescribe(
     }
 
     // the a2a filter below matches commands against these names, and the frame itself is bounded
-    // only by the ~1 MiB stream-0 cap: the counts are what keeps that pairing cheap
+    // only by the 16 MiB an agent's stream-0 message may carry: the counts are what keeps that pairing cheap
     const tools: ToolSchema[] = [];
     const rawTools = asArray(p["tools"]);
     if (rawTools.length > TOOLS_MAX) {
@@ -316,7 +316,7 @@ export class Registry {
         const peer = new AgentPeer(socket, pinName, this.log, from, deadlineGraceMs, defaultTimeoutMs);
         peer.onRequest = (frame, p) => this.serve(frame, p);
         peer.onClosed = (p) => this.forget(p);
-        // hello is one small frame; describe can near 1 MiB on a thin uplink, so it keeps the longer wait
+        // hello is one small frame; describe is far larger (512 KiB from the SDK, up to 16 MiB from any agent), so it keeps the longer wait
         setTimeout(() => {
             if (peer.stage === "new" && peer.socket.open) peer.close(1002, "no hello in time");
         }, HELLO_TIMEOUT_MS).unref();

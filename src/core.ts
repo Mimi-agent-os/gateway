@@ -50,7 +50,7 @@ export interface GatewayCoreOptions {
     db?: GatewayDb;
     log?: (msg: string) => void;
     healthIntervalMs?: number | undefined;
-    cache?: { maxBytes?: number | undefined; ttlMs?: number | undefined };
+    cache?: { maxBytes?: number | undefined; ttlMs?: number | undefined; maxPages?: number | undefined };
     /** Tests only: the window an agent's own chat notices fold in. */
     changedWindowMs?: number | undefined;
     /** Tests only: how long past a request's deadline the gateway still waits for the agent. */
@@ -186,7 +186,13 @@ export function createGatewayCore(opts: GatewayCoreOptions = {}): GatewayCore {
         defaultTimeoutMs: opts.defaultTimeoutMs,
     });
     setUsageRecordedHook(db, (agent) => events.emit({ type: "usage_changed", agent }));
-    const sessions = new SessionCache({ registry, log, maxBytes: opts.cache?.maxBytes, ttlMs: opts.cache?.ttlMs });
+    const sessions = new SessionCache({
+        registry,
+        log,
+        maxBytes: opts.cache?.maxBytes,
+        ttlMs: opts.cache?.ttlMs,
+        maxPages: opts.cache?.maxPages,
+    });
     const appTickets = new AppTickets({ events, ttlMs: opts.apps?.ttlMs });
     const appBridge = createAppBridge({ db, registry, events, log, headMs: opts.apps?.headMs, stallMs: opts.apps?.stallMs });
     const devices = new DeviceService(db, events, log, opts.devices);

@@ -1,10 +1,14 @@
 import "./pq-home.ts";
 
 import assert from "node:assert/strict";
-import { createServer, type Server, type ServerResponse } from "node:http";
+import { createServer, IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { Socket } from "node:net";
 import test from "node:test";
 
-import { chainHash, REPLY_OF, type EventBody, type SessionHead, type StoredEvent } from "@mimi-os/protocol";
+import { chainHash, REPLY_OF, type CompactionPayload, type EventBody, type SessionHead, type StoredEvent } from "@mimi-os/protocol";
+import type { GatewayCore } from "../src/core.ts";
+import { Router } from "../src/http/router.ts";
+import { registerTurns } from "../src/http/turns.ts";
 import { addModel, setDefaultModel } from "../src/llm/models.ts";
 import { createFakeAgentCore, fakeAgentSocket, fakeIdentity, type FakeAgentCore } from "@mimi-os/sdk/testing";
 import { autoApprove, boot, callTurn, textTurn, waitFor, type Env, type NdjsonStream } from "./harness-env.ts";
@@ -595,4 +599,192 @@ test("a turn with images on a non-vision model is refused before any provider ca
     } finally {
         await env.stop();
     }
+});
+
+test("a message with more images than half the window holds is refused before it is stored", async () => {
+    const env = await boot();
+    try {
+        // 32k: floor(0.5 x 32 000 / 1 500) = 10 images in one message
+        addModel({ name: "eye", provider: "llamacpp", endpoint: env.model.url, contextTokens: 32_000, vision: true }, env.db);
+        setDefaultModel("eye", env.db);
+        const h = await connected(env, { name: "seer" });
+        const session = h.createSession("imgs", true);
+        const eleven = Array.from({ length: 11 }, () => IMG);
+        await assert.rejects(
+            env.core.runTurn({ agent: "seer", session, text: "look", images: eleven, attended: true, title: false }),
+            /11 images are more than model "eye" takes in one message \(10\)/,
+        );
+        assert.equal(h.sessions.get(session)!.events.length, 0, "nothing was stored, so nothing is stuck in history");
+        assert.equal(env.model.requests.length, 0);
+
+        env.model.nextTurn(textTurn("ten photos"));
+        const out = await env.core.runTurn({ agent: "seer", session, text: "look", images: eleven.slice(1), attended: true, title: false });
+        assert.equal(out.text, "ten photos");
+    } finally {
+        await env.stop();
+    }
+});
+
+test("a fallback whose window cannot hold this turn's images is not taken", async () => {
+    const env = await boot();
+    const down: Server = createServer((req, res) => {
+        req.resume();
+        req.on("end", () => res.writeHead(400, { "content-type": "application/json" }).end('{"error":"down"}'));
+    });
+    await new Promise<void>((ready) => down.listen(0, "127.0.0.1", ready));
+    try {
+        const url = `http://127.0.0.1:${(down.address() as { port: number }).port}`;
+        addModel({ name: "wide", provider: "llamacpp", endpoint: url, contextTokens: 128_000, vision: true }, env.db);
+        // 16k: five images at most
+        addModel({ name: "small", provider: "llamacpp", endpoint: env.model.url, contextTokens: 16_000, vision: true }, env.db);
+        env.pin("vis");
+        env.db.setModelsPolicy("vis", { allowed: ["wide", "small"], primary: "wide", fallback: "small" });
+        const h = await env.connect({ name: "vis", tools: [], handlers: {} }, false);
+        await waitFor(() => env.core.agent("vis").connected, 4000, "vis ready");
+        const session = h.createSession("imgs", true);
+
+        await assert.rejects(
+            env.core.runTurn({ agent: "vis", session, text: "look", images: Array.from({ length: 8 }, () => IMG), title: false }),
+            /400/,
+        );
+        assert.equal(env.model.requests.length, 0, "the small window was never asked");
+
+        env.model.nextTurn(textTurn("four photos"));
+        const out = await env.core.runTurn({ agent: "vis", session, text: "look", images: Array.from({ length: 4 }, () => IMG), title: false });
+        assert.equal(out.text, "four photos", "four fit the fallback");
+    } finally {
+        down.closeAllConnections();
+        await new Promise((done) => down.close(done));
+        await env.stop();
+    }
+});
+
+test("a turn whose own images carry the chat past imagesAt folds the older ones before its call, its own staying pixels", async () => {
+    const env = await boot();
+    try {
+        addModel({ name: "eye", provider: "llamacpp", endpoint: env.model.url, contextTokens: 128_000, vision: true }, env.db);
+        setDefaultModel("eye", env.db);
+        const h = await connected(env, { name: "seer" });
+        const session = h.createSession("imgs", true);
+        const photo = (n: number): string => `data:image/png;base64,${String(n).padStart(40, "A")}`;
+        h.append(session, [
+            { type: "message", payload: { role: "user", content: "old", images: [1, 2, 3, 4, 5, 6, 7, 8].map(photo) } },
+            { type: "message", payload: { role: "assistant", content: "seen" } },
+        ]);
+        const own = Array.from({ length: 32 }, (_v, i) => photo(100 + i));
+        env.model.nextTurn(textTurn(Array.from({ length: 8 }, (_v, i) => `${i + 1}: old photo ${i + 1}`).join("\n")));
+        env.model.nextTurn(textTurn("thirty-two new ones"));
+        // 8 + 32 = 40 undescribed, past the 25 of a 128k window
+        await env.core.runTurn({ agent: "seer", session, text: "and these", images: own, title: false });
+
+        assert.equal(env.model.requests.length, 2, "one describe call, then the turn");
+        const turn = (env.model.requests[1]!["messages"] as Array<{ role: string; content: unknown }>).filter((m) => m.role === "user");
+        const urls = (m: { content: unknown }): string[] =>
+            Array.isArray(m.content) ? (m.content as Array<{ image_url?: { url: string } }>).flatMap((p) => (p.image_url ? [p.image_url.url] : [])) : [];
+        assert.deepEqual(urls(turn[0]!), [], "the old message reads its notes");
+        assert.match(String(turn[0]!.content), /old\n\[earlier image: old photo 1\]/);
+        assert.deepEqual(urls(turn[1]!), own);
+        const notes = h.sessions.get(session)!.events.filter((e) => e.type === "compaction").map((e) => e.payload as CompactionPayload);
+        assert.deepEqual(notes.map((n) => n.images?.map((i) => i.seq)), [[1]]);
+    } finally {
+        await env.stop();
+    }
+});
+
+type Posted = { req: IncomingMessage; reply: Promise<{ status: number; body: string }> };
+
+/** POST …/messages straight into the turn route, its body pushed by hand; `running` says whether the chat has a turn. */
+function turnRoute(running: () => boolean): () => Posted {
+    const core = {
+        registry: { get: () => ({}) },
+        turns: { get: () => (running() ? {} : undefined) },
+    } as unknown as GatewayCore;
+    const router = new Router();
+    registerTurns(router, core);
+    return () => {
+        const req = new IncomingMessage(new Socket());
+        req.method = "POST";
+        req.url = "/api/agents/toto/conversations/1/messages";
+        const reply = Promise.withResolvers<{ status: number; body: string }>();
+        const res = { headersSent: false, status: 0 };
+        const fake = Object.assign(res, {
+            writeHead: (code: number): void => {
+                res.status = code;
+                res.headersSent = true;
+            },
+            end: (body: string): void => reply.resolve({ status: res.status, body }),
+        });
+        void router.dispatch(req, fake as unknown as ServerResponse);
+        return { req, reply: reply.promise };
+    };
+}
+
+test("the turn route answers 409 and 429 before reading a body, and reads at most two bodies at once", async () => {
+    let running = false;
+    const post = turnRoute(() => running);
+    const pending = async (p: { reply: Promise<unknown> }): Promise<boolean> =>
+        (await Promise.race([p.reply.then(() => false), new Promise<boolean>((r) => setTimeout(() => r(true), 50))]));
+
+    const first = post();
+    first.req.push('{"text":"one", "images": [');
+    const second = post();
+    second.req.push('{"te');
+    assert.ok(await pending(first), "an upload being read has no reply yet");
+    const third = post();
+    assert.deepEqual(await third.reply, { status: 429, body: JSON.stringify({ error: "two other messages are still uploading; send this one again in a moment" }) });
+    assert.ok(third.req.readableLength === 0, "and its body was never read");
+
+    // a body that ends, however it ends, frees its slot
+    first.req.push("nope");
+    first.req.push(null);
+    assert.equal((await first.reply).status, 400);
+    const fourth = post();
+    fourth.req.push('{"text":');
+    assert.ok(await pending(fourth));
+    assert.equal((await post().reply).status, 429);
+
+    // a chat with a turn running is refused before a byte is read
+    running = true;
+    assert.equal((await post().reply).status, 409);
+    second.req.destroy();
+    assert.equal((await second.reply).status, 400);
+    fourth.req.push(null);
+    assert.equal((await fourth.reply).status, 400);
+    running = false;
+    const fifth = post();
+    fifth.req.push('{"text":""}');
+    fifth.req.push(null);
+    assert.deepEqual(await fifth.reply, { status: 400, body: JSON.stringify({ error: "pass { text } or { images }" }) }, "both slots are free again");
+});
+
+test("an upload that sends nothing for 30 s is dropped and gives its slot back; one still arriving keeps it", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const post = turnRoute(() => false);
+    const flow = (): Promise<void> => new Promise((r) => setImmediate(r));
+    const stalled = post();
+    stalled.req.push('{"text":"gone off the network", "images": [');
+    const slow = post();
+    slow.req.push('{"text":"a slow uplink"');
+    await flow();
+    assert.equal((await post().reply).status, 429);
+
+    t.mock.timers.tick(29_000);
+    slow.req.push(', "images": [');
+    await flow();
+    t.mock.timers.tick(1_000);
+    await flow();
+    assert.deepEqual(await stalled.reply, { status: 400, body: JSON.stringify({ error: "the body stopped arriving" }) });
+    assert.ok(stalled.req.destroyed);
+
+    const next = post();
+    next.req.push('{"text":"hello"');
+    await flow();
+    assert.equal((await post().reply).status, 429, "the slow one still holds its slot, the new one the freed one");
+
+    t.mock.timers.tick(29_000);
+    await flow();
+    assert.deepEqual(await slow.reply, { status: 400, body: JSON.stringify({ error: "the body stopped arriving" }) }, "30 s after its last byte");
+    t.mock.timers.tick(1_000);
+    await flow();
+    assert.equal((await next.reply).status, 400);
 });

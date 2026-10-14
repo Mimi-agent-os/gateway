@@ -21,12 +21,15 @@ import {
     PairingInitiator,
     PairingResponder,
     gatewayId,
+    MAX_AGENT_MESSAGE_BYTES,
     parseInviteUri,
     PROTOCOL_VERSION,
 } from "@mimi-os/protocol";
 
 import { pairDevice } from "../src/device-client.ts";
 import type { HubEvent } from "../src/events.ts";
+import { MAX_STREAM0_BYTES } from "../src/registry/devices.ts";
+import { connectRawAgent } from "./agent-wire.ts";
 import { dialRaw, rawSession, type RawSession, type RawWire } from "./channel-client.ts";
 import { activeDevice, boot, waitFor, type Env } from "./harness-env.ts";
 
@@ -923,6 +926,52 @@ test("redeeming an agent invite announces agent_enrolled; a redemption under the
         // a fresh key redeemed for a name that already has a pin is an enrolment too
         await pairDevice(env.ws, invite(), new Uint8Array(randomBytes(32)), "helper");
         assert.equal(seen.length, 2);
+    } finally {
+        await env.stop();
+    }
+});
+
+/** `bytes` as one stream-0 message in 16 KiB frames, the way both peers chunk them. */
+function sendChunked(send: (flags: number, payload: Uint8Array) => void, bytes: Uint8Array, end = true): void {
+    for (let at = 0; at < bytes.length; at += 16 * 1024) {
+        const last = at + 16 * 1024 >= bytes.length;
+        send(last && end ? FLAG_END : FLAG_DATA, bytes.subarray(at, at + 16 * 1024));
+    }
+}
+
+test("an agent's stream-0 message may be 16 MiB, reassembled whole; one more frame closes only that session", { timeout: 60_000 }, async () => {
+    const env = await boot();
+    try {
+        const h = await env.connect({ name: "big", tools: [], handlers: {} });
+        await waitFor(() => env.core.registry.get("big") !== undefined, 4000, "big registered");
+        const frame = { id: "huge", type: "ask_approve", payload: { label: "" }, pad: "" };
+        h.send({ ...frame, pad: "x".repeat(MAX_AGENT_MESSAGE_BYTES - Buffer.byteLength(JSON.stringify(frame))) });
+        await waitFor(() => h.frames().some((f) => f["id"] === "huge"), 30_000, "the reply to a message of exactly 16 MiB");
+        assert.ok(h.socketOpen());
+
+        const raw = await connectRawAgent(env, { name: "raw" });
+        sendChunked((flags, payload) => raw.send({ stream: 0, flags, payload }), new Uint8Array(MAX_AGENT_MESSAGE_BYTES + 1).fill(0x20), false);
+        await waitFor(() => raw.closed, 10_000, "the over-cap session to close");
+        assert.ok(h.socketOpen(), "the other agent's session lives on");
+        assert.ok(env.core.registry.get("big"));
+    } finally {
+        await env.stop();
+    }
+});
+
+test("a device's control message on stream 0 still stops at 1 MiB", async () => {
+    const env = await boot();
+    try {
+        const { s } = await activeDevice(env, "phone");
+        const live = await rawSession(env, s);
+        assert.ok(live);
+        const ping = { t: "ping", pad: "" };
+        const whole = new TextEncoder().encode(JSON.stringify({ ...ping, pad: "x".repeat(MAX_STREAM0_BYTES - JSON.stringify(ping).length) }));
+        assert.equal(whole.length, MAX_STREAM0_BYTES);
+        sendChunked((flags, payload) => live.send(0, flags, payload), whole);
+        assert.deepEqual(await nextJson(live), { t: "pong" });
+        sendChunked((flags, payload) => live.send(0, flags, payload), new Uint8Array(MAX_STREAM0_BYTES + 1).fill(0x20), false);
+        assert.equal(await live.frame(), null, "one byte more closes the session");
     } finally {
         await env.stop();
     }

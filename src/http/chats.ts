@@ -16,7 +16,8 @@ interface HistoryMessageWire {
     id: number;
     role: string;
     content: string;
-    images?: string[] | undefined;
+    /** How many images the message carries: their pixels come from …/messages/:id/images. */
+    images?: number | undefined;
     thinking?: string | undefined;
     toolCalls?: { id: string; name: string; arguments: string }[] | undefined;
     toolCallId?: string | undefined;
@@ -29,7 +30,7 @@ interface HistoryMessageWire {
 
 /** A payload the agent wrote past the SDK reaches here unvalidated — no field is read before the
  *  same `projectMessage` the model path uses has narrowed it. */
-function toHistoryMessage(ev: StoredEvent): HistoryMessageWire | null {
+function toHistoryMessage(ev: StoredEvent, entry: CacheEntry): HistoryMessageWire | null {
     const raw = ev.payload as { summary?: unknown; thinking?: unknown; meta?: unknown } | null | undefined;
     if (ev.type === "compaction") {
         const summary = raw?.summary;
@@ -62,7 +63,7 @@ function toHistoryMessage(ev: StoredEvent): HistoryMessageWire | null {
         id: ev.seq,
         role: message.role,
         content: message.content ?? "",
-        images: message.images,
+        images: entry.images.get(ev.seq),
         thinking: typeof raw?.thinking === "string" ? raw.thinking : undefined,
         toolCalls: message.tool_calls,
         toolCallId: message.tool_call_id,
@@ -175,18 +176,59 @@ export function registerChats(router: Router, core: GatewayCore): void {
         }
         // the same truncate cuts protocol's foldEvents applies
         const cuts = entry.events.flatMap((e) => truncateCut(e) ?? []);
-        // compaction-archived raw rows are still served unflagged
+        // compaction-archived raw rows are still served unflagged; a pass that only described images shows nothing
         const rows = entry.events.filter(
             (e) =>
-                (e.type === "message" || e.type === "compaction") &&
+                (e.type === "message" || (e.type === "compaction" && typeof (e.payload as { summary?: unknown } | null)?.summary === "string")) &&
                 !cuts.some((c) => e.seq >= c.from && e.seq < c.at),
         );
         const upper = before === undefined ? rows : rows.filter((r) => r.seq < before);
         const page = upper.slice(Math.max(0, upper.length - limit));
         return json(ctx.res, 200, {
-            items: page.flatMap((e) => toHistoryMessage(e) ?? []),
+            items: page.flatMap((e) => toHistoryMessage(e, entry) ?? []),
             hasMore: upper.length > page.length,
         });
+    });
+
+    router.get("/api/agents/:agent/conversations/:session/messages/:id/images", async (ctx) => {
+        const agent = ctx.param("agent");
+        const session = Number(ctx.param("session"));
+        const seq = Number(ctx.param("id"));
+        // a reader that leaves gives up its place among the agent reads the cache lets through
+        const left = new AbortController();
+        ctx.res.once("close", () => left.abort(new Error("the reader left")));
+        let entry: CacheEntry;
+        try {
+            entry = await core.sessions.ensure(agent, session, left.signal);
+        } catch (e) {
+            if (!left.signal.aborted) json(ctx.res, 503, { error: (e as Error).message });
+            return;
+        }
+        if (!entry.images.get(seq)) return json(ctx.res, 404, { error: "this message has no images" });
+        let images: string[];
+        try {
+            images = await core.sessions.images(entry, seq, left.signal);
+        } catch (e) {
+            if (!left.signal.aborted) json(ctx.res, 503, { error: (e as Error).message });
+            return;
+        }
+        // one data-URI per write: a single 15 MB end() would sit queued past the channel's stall deadline on a slow device
+        ctx.res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+        ctx.res.write('{"images":[');
+        for (const [i, uri] of images.entries()) {
+            if (left.signal.aborted) return;
+            if (ctx.res.write(`${i ? "," : ""}${JSON.stringify(uri)}`)) continue;
+            await new Promise<void>((on) => {
+                const go = (): void => {
+                    ctx.res.off("drain", go);
+                    ctx.res.off("close", go);
+                    on();
+                };
+                ctx.res.on("drain", go);
+                ctx.res.on("close", go);
+            });
+        }
+        if (!left.signal.aborted) ctx.res.end("]}");
     });
 
     router.post("/api/agents/:agent/conversations/:session/truncate", async (ctx) => {
@@ -202,12 +244,12 @@ export function registerChats(router: Router, core: GatewayCore): void {
         if (!peer) return json(ctx.res, 503, { error: `agent "${agent}" is not connected` });
         const event: EventBody = { type: "truncate", payload: { fromSeq: messageId } };
         try {
-            await peer.request("append", { session, events: [event] });
+            const ok = await peer.request("append", { session, events: [event] });
+            // append-only: nothing is deleted, the cut point just stops being read; replayed, never reloaded
+            core.sessions.applyAppend(agent, session, [event], ok.head);
         } catch (e) {
             return json(ctx.res, 502, { error: (e as Error).message });
         }
-        // append-only: nothing is deleted, the cut point just stops being read
-        core.sessions.drop(agent, session);
         core.events.emit({ type: "chat_changed", agent, session });
         return json(ctx.res, 200, { ok: true });
     });

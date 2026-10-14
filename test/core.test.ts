@@ -160,7 +160,7 @@ test("a chain too big for history is refused whole; the agent and its other chat
             name: "toto",
             manifest: { chain: true },
             tools: READ_TOOLS,
-            handlers: { look: { text: "y".repeat(600_000) }, read: { text: "READ" } },
+            handlers: { look: { text: "y".repeat(3_000_000) }, read: { text: "READ" } },
         });
         h.core.setMisbehavior("read", "silent");
         // another chat on the same agent, waiting on its own invoke the whole time
@@ -176,7 +176,8 @@ test("a chain too big for history is refused whole; the agent and its other chat
         await waitFor(() => h.invokes().length === 1, 4000, "the other chat's invoke");
 
         const sid = h.createSession();
-        const steps = [{ tool: "look" }, { tool: "look" }];
+        // six steps of 3 MB: past the 16 MiB one stored event can be
+        const steps = Array.from({ length: 6 }, () => ({ tool: "look" }));
         env.model.nextTurn(callTurn([{ id: "c1", name: "chain", args: JSON.stringify({ steps }) }]));
         env.model.nextTurn(textTurn("asked for less"));
         const events: Array<Record<string, unknown>> = [];
@@ -187,7 +188,7 @@ test("a chain too big for history is refused whole; the agent and its other chat
             title: false,
             emit: (ev) => void events.push(ev),
         });
-        assert.equal(h.invokes().length, 3, "both steps ran");
+        assert.equal(h.invokes().length, 7, "every step ran");
         assert.equal(out.dropped, false);
         assert.equal(out.text, "asked for less");
         const refused = events.find((ev) => ev["type"] === "tool_result")?.["text"];
@@ -216,9 +217,9 @@ test("a message too big for the channel fails only its own request, never the ag
     try {
         const h = await connected(env, { name: "toto", tools: READ_TOOLS, handlers: {} });
         const sid = h.createSession();
-        const out = await env.core.runTurn({ agent: "toto", session: sid, text: "z".repeat(1_100_000), title: false });
+        const out = await env.core.runTurn({ agent: "toto", session: sid, text: "z".repeat(16_800_000), title: false });
         assert.equal(out.dropped, true, "the turn whose append could not be sent");
-        assert.ok(env.logs.some((l) => /append lost — .*over the 1048576 one channel message carries/.test(l)));
+        assert.ok(env.logs.some((l) => /append lost — .*over the 16777216 one channel message carries/.test(l)));
         assert.ok(h.socketOpen(), "the agent's session lives on");
 
         env.model.nextTurn(textTurn("still here"));

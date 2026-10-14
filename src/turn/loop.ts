@@ -1,6 +1,6 @@
 /** The turn engine: HEAD-check, prompt, tool batch, gate, invoke, append — the gateway's loop. */
 
-import { projectMessage, sanitizeHistory } from "@mimi-os/protocol";
+import { IMAGE_TOKENS, MAX_EVENT_BYTES, projectMessage, sanitizeHistory, TURN_IMAGE_SHARE } from "@mimi-os/protocol";
 import type {
     EventBody,
     FinishReason,
@@ -15,10 +15,9 @@ import type {
 import { estimateUsage, newCallId, recordLlmCall } from "../store/accounting.ts";
 import { autoTitle } from "./autotitle.ts";
 import {
-    planCompaction,
+    compactionPass,
     planSessionClose,
     shouldCompact,
-    summarize,
     thresholdsFor,
     toolTrafficSummary,
 } from "./compaction.ts";
@@ -27,7 +26,7 @@ import { APPROVAL_TIMEOUT_MS } from "../gates/gates.ts";
 import { buildGatewayTools, type GatewayToolCtx } from "./gateway-tools.ts";
 import { systemPrompt, visibleTo } from "./prompt.ts";
 import { NotSentError } from "../llm/base/index.ts";
-import { createProvider } from "../llm/models.ts";
+import { createProvider, type ModelConfig } from "../llm/models.ts";
 import { admitAtDequeue, LimitReached, resolveModelFor } from "../llm/policy.ts";
 import { enqueueCall, type CallPriority } from "../llm/queue.ts";
 import {
@@ -40,7 +39,6 @@ import {
     type TurnOutcome,
     type TurnRequest,
 } from "./loop-types.ts";
-import { MAX_STREAM0_BYTES } from "../registry/devices.ts";
 import { PeerError } from "../registry/peer.ts";
 import { AgentGone } from "./run.ts";
 
@@ -55,7 +53,7 @@ const EXPIRED =
 
 /** What one stored event may serialize to: its append, and the events_after page that later
  *  carries it back, must each fit one channel message with the frame around it. */
-const STORED_EVENT_MAX_BYTES = MAX_STREAM0_BYTES - 4_096;
+const STORED_EVENT_MAX_BYTES = MAX_EVENT_BYTES;
 
 /** A line the gateway itself wrote — no agent said it, and no model call produced it. */
 const SYSTEM_NOTE: MessageMeta = { actor: { kind: "system" } };
@@ -100,6 +98,14 @@ export async function runTurn(deps: LoopDeps, req: TurnRequest): Promise<TurnOut
     if (req.images && req.images.length > 0 && !cfg.vision) {
         throw resolved.replaces ? new LimitReached(resolved.replaces.name) : new Error(`model "${cfg.name}" has no image support`);
     }
+    const pictures = req.images?.length ?? 0;
+    const fits = (m: ModelConfig): number => Math.floor((TURN_IMAGE_SHARE * m.contextTokens) / IMAGE_TOKENS);
+    // refused before the message is stored: one that no fold can fit would sit in history for good
+    if (pictures > fits(cfg)) {
+        throw resolved.replaces
+            ? new LimitReached(resolved.replaces.name)
+            : new Error(`${pictures} images are more than model "${cfg.name}" takes in one message (${fits(cfg)})`);
+    }
     let provider = createProvider(cfg.name, deps.db);
     let thresholds = thresholdsFor(cfg, deps.db);
     let queueKey = cfg.endpointUrl;
@@ -122,6 +128,7 @@ export async function runTurn(deps: LoopDeps, req: TurnRequest): Promise<TurnOut
     let dropped = false;
     let lastPromptTokens = 0;
     let compactedThisTurn = false;
+    let foldedImagesThisTurn = false;
     let pendingClose: string | null = null;
     // the tool run a fold may cover: [firstToolSeq, lastResultSeq], never across a compaction event
     let firstToolSeq: number | null = null;
@@ -208,26 +215,43 @@ export async function runTurn(deps: LoopDeps, req: TurnRequest): Promise<TurnOut
         }
     }
 
-    /** Only at a paired point, and only on real usage — never on an estimate. A room transcript
-     *  is published history and is never folded: only an agent's own chain compacts. */
+    /** Only at a paired point. The text trigger reads real usage, never an estimate; the image
+     *  trigger counts the undescribed images a vision model would be sent. At most one summary and
+     *  one image fold a turn. A room transcript is published history and is never folded: only an
+     *  agent's own chain compacts. */
     async function maybeCompact(): Promise<void> {
-        if (session === null || !thresholds || compactedThisTurn || dropped) return;
-        if (!shouldCompact(thresholds, cfg.contextTokens, lastPromptTokens)) return;
+        if (session === null || !thresholds || dropped) return;
+        const text = !compactedThisTurn && shouldCompact(thresholds, cfg.contextTokens, lastPromptTokens);
+        if (!text && (foldedImagesThisTurn || !cfg.vision)) return;
         const cur = await deps.sessions.ensure(agent, session, req.signal).catch(() => null);
         if (!cur) return;
-        const plan = planCompaction(deps.sessions.folded(cur), cur.events[0]?.seq ?? 0, thresholds);
-        if (!plan) return;
-        const summary = await summarize({ agent, session, cfg, turnSeq, signal: req.signal }, plan.lines, deps.db);
-        if (summary === null) return; // no summary → NO compaction; real history is never stubbed
-        compactedThisTurn = true;
-        if ((await append([{ type: "compaction", payload: { summary, covers: plan.covers } }])) === null) return;
+        let undescribed = 0;
+        for (const count of deps.sessions.undescribed(cur).values()) undescribed += count;
+        const images = !foldedImagesThisTurn && cfg.vision && undescribed > thresholds.imagesAt && Date.now() >= cur.foldAfter;
+        if (!text && !images) return;
+        foldedImagesThisTurn ||= images;
+        const call = { agent, session, cfg, turnSeq, signal: req.signal };
+        const { payload, plan } = await compactionPass(call, deps.sessions, cur, thresholds, { text, images }, deps.db);
+        if (images && cur.foldAfter > Date.now()) {
+            deps.log(`[loop] ${where}: some older images got no description; the next image fold waits until ${new Date(cur.foldAfter).toISOString()}\n`);
+        }
+        // no summary → NO compaction of the text; real history is never stubbed
+        if (payload?.summary !== undefined) compactedThisTurn = true;
+        // a Stop mid-pass writes nothing: the append would fail on the stopped signal and drop the turn
+        if (!payload || req.signal?.aborted || (await append([{ type: "compaction", payload }])) === null) return;
+        const described = payload.images?.length ?? 0;
+        if (payload.summary === undefined || !plan) {
+            deps.log(`[loop] ${where}: described the images of ${described} messages (${undescribed} were undescribed)\n`);
+            return;
+        }
         // a fold over this event would drop its summary for good: the next tool run starts after it
         firstToolSeq = null;
         usedFoldTool = false;
         usedNonFoldTool = false;
         deps.log(
             `[loop] ${where}: compacted ${plan.prefixMessages} ` +
-                `messages (~${plan.prefixTokens} tokens) at ${lastPromptTokens}\n`,
+                `messages (~${plan.prefixTokens} tokens) at ${lastPromptTokens}` +
+                `${described ? `, describing the images of ${described}` : ""}\n`,
         );
         emit?.({ type: "compacted", covers: plan.covers, messages: plan.prefixMessages });
     }
@@ -343,6 +367,8 @@ export async function runTurn(deps: LoopDeps, req: TurnRequest): Promise<TurnOut
         // the replay boundary: everything this turn persists comes after this seq — emitted only
         // when the append really named one, never invented
         if (turnSeq !== null) req.emit?.({ type: "turn_started", turnSeq });
+        // images past the window are folded before the call that would carry them
+        await maybeCompact();
     }
 
     for (let round = 0; round < MAX_TOOL_TURNS; round++) {
@@ -501,8 +527,8 @@ export async function runTurn(deps: LoopDeps, req: TurnRequest): Promise<TurnOut
         // turn: a finish_reason of "length"/"content_filter" is a real answer, and any other policy
         // refusal (the PeerError above) is not an outage either
         const outage = !!failure && (!(failure instanceof PeerError) || failure instanceof LimitReached);
-        // a text-only fallback would answer this turn's images blind
-        const canSee = !req.images?.length || fallbackCfg?.vision === true;
+        // a text-only fallback would answer this turn's images blind, and a small window could not hold them
+        const canSee = !pictures || (fallbackCfg?.vision === true && pictures <= fits(fallbackCfg));
         if (outage && fallbackCfg && canSee && !usedFallback && req.signal?.aborted !== true) {
             usedFallback = true;
             deps.log(
