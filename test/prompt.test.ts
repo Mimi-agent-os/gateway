@@ -14,13 +14,15 @@ import type { ModelsPolicy } from "../src/store/db.ts";
 import { autoTitle } from "../src/turn/autotitle.ts";
 import { momentStamp, nowStamp } from "../src/turn/prompt.ts";
 import type { Harness } from "./agent-harness.ts";
-import { boot, callTurn, textTurn, waitFor, type Env } from "./harness-env.ts";
+import { autoApprove, boot, callTurn, textTurn, waitFor, type Env } from "./harness-env.ts";
 
 const PNG = "data:image/png;base64,iVBORw0KGgo=";
 const OMITTED = "[image omitted: this model cannot see images]";
 
 type WireMessage = { role: string; content: unknown };
 const sentMessages = (m: FakeModel, i: number): WireMessage[] => m.requests[i]?.["messages"] as WireMessage[];
+/** The newest user line of request `i`: the stamp it opens with is what the model reads as now. */
+const newestUser = (m: FakeModel, i: number): unknown => sentMessages(m, i).findLast((x) => x.role === "user")?.content;
 
 /** The stamp toto's user line at `seq` opens with: the time the gateway's cache holds for that event. */
 const stampOf = (env: Env, sid: number, seq: number): string =>
@@ -177,13 +179,13 @@ test("withPrompt: a one-shot opens with the same system prompt a turn builds; wi
         assert.equal(reply["status"], "ok", JSON.stringify(reply));
         const [system, user] = sentMessages(env.model, 0);
         assert.equal(system?.role, "system");
-        assert.match(String(system?.content), /^You are Toto, a terse planner\.\n\nThe owner's cat is called Miso\.\n\nCurrent date\/time: [A-Z][a-z]+day \d{4}-\d\d-\d\d \d\d:\d\d \([\w/+-]+, UTC[+-]\d\d:\d\d\)\nA bracketed line [^\n]+$/);
+        assert.match(String(system?.content), /^You are Toto, a terse planner\.\n\nThe owner's cat is called Miso\.\n\nA bracketed line [^\n]+$/);
+        // no stamp is added: a routine's caller (the crons pack) writes the time into its own line
         assert.deepEqual(user, { role: "user", content: "the cat?" });
 
         env.model.nextTurn(textTurn("Miso"));
         await env.core.runTurn({ agent: "toto", session: h.createSession(), text: "the cat?", title: false });
-        const undated = (m: WireMessage | undefined): string => String(m?.content).replace(/Current date\/time: .*/, "");
-        assert.equal(undated(sentMessages(env.model, 1)[0]), undated(system), "one builder for both");
+        assert.deepEqual(sentMessages(env.model, 1)[0], system, "one builder for both");
 
         env.model.nextTurn(textTurn("Miso"));
         await chat(h, "without", { messages: [{ role: "user", content: "the cat?" }] });
@@ -416,7 +418,7 @@ test("a moment reads as weekday, date and time in the owner's zone (MIMI_TZ); no
     await inZone("UTC", () => assert.match(nowStamp(), / \(UTC, UTC\+00:00\)$/));
 });
 
-test("the system prompt's date line and get_time's answer are the same weekday-and-zone stamp", async () => {
+test("the system prompt names the zone and offset every stamp is read in, the one get_time answers in", async () => {
     await inZone("Asia/Kolkata", async () => {
         const env = await boot();
         try {
@@ -426,17 +428,122 @@ test("the system prompt's date line and get_time's answer are the same weekday-a
             env.model.nextTurn(textTurn("it is late"));
             await env.core.runTurn({ agent: "toto", session: h.createSession(), text: "what time is it?", title: false });
 
-            const now = `${NOW} \\(Asia/Kolkata, UTC\\+05:30\\)`;
-            // the date line, then the one note that says what a stamp is so the model never writes one
+            const zone = "Asia/Kolkata, UTC\\+05:30";
+            // the one note that says what a stamp is, so the model never writes one, and which one is now
             assert.match(
                 String(sentMessages(env.model, 0)[0]?.content),
-                new RegExp(`\n\nCurrent date/time: ${now}\nA bracketed line opening a user message is added automatically: [^\n]+ Never write one yourself\\.$`),
+                new RegExp(
+                    `\n\nA bracketed line opening a user message is added automatically: [^\n]+ in the owner's time zone \\(${zone}\\)\\. ` +
+                        "The newest one is the time now: [^\n]+ Never write one yourself\\.$",
+                ),
             );
-            assert.match(String(sentMessages(env.model, 1).find((m) => m.role === "tool")?.content), new RegExp(`^${now}$`));
+            assert.match(String(sentMessages(env.model, 1).find((m) => m.role === "tool")?.content), new RegExp(`^${NOW} \\(${zone}\\)$`));
         } finally {
             await env.stop();
         }
     });
+});
+
+test("the system prompt holds no clock: two minutes apart it is byte for byte the same, and only the newest stamp moves", async (t) => {
+    await inZone("Europe/Kyiv", async () => {
+        const env = await boot();
+        try {
+            const h = await env.connect({ name: "toto", tools: [], handlers: {} });
+            await waitFor(() => env.core.registry.get("toto") !== undefined, 4000, "registration");
+            const sid = h.createSession("plans");
+            t.mock.timers.enable({ apis: ["Date"], now: Date.UTC(2026, 9, 12, 7, 4, 50) });
+            env.model.nextTurn(textTurn("one"));
+            await env.core.runTurn({ agent: "toto", session: sid, text: "first", title: false });
+            t.mock.timers.setTime(Date.UTC(2026, 9, 12, 7, 6, 50));
+            env.model.nextTurn(textTurn("two"));
+            await env.core.runTurn({ agent: "toto", session: sid, text: "second", title: false });
+
+            const [before, after] = [sentMessages(env.model, 0), sentMessages(env.model, 1)];
+            assert.equal(
+                before[0]?.content,
+                "You are a concise and helpful assistant.\n\nA bracketed line opening a user message is added automatically: " +
+                    "when it was sent (in a room, also by whom), in the owner's time zone (Europe/Kyiv, UTC+03:00). The newest one " +
+                    "is the time now: count today, tomorrow and every other relative date from it. Never write one yourself.",
+            );
+            assert.deepEqual(after.map((m) => [m.role, m.content]), [
+                ["system", before[0]?.content],
+                ["user", "[Monday 2026-10-12 10:04]\nfirst"],
+                ["assistant", "one"],
+                ["user", "[Monday 2026-10-12 10:06]\nsecond"],
+            ]);
+            // the whole first request is a prefix of the second, tools included: the provider's prompt cache holds
+            assert.equal(JSON.stringify(after.slice(0, before.length)), JSON.stringify(before));
+            assert.deepEqual(env.model.requests[1]?.["tools"], env.model.requests[0]?.["tools"]);
+        } finally {
+            await env.stop();
+        }
+    });
+});
+
+test("an owner's message, the follow-up the app sends once that turn is over, and a delegated task each open stamped with when they started", async (t) => {
+    const env = await boot();
+    const stopGates = autoApprove(env);
+    try {
+        const boss = await env.connect({ name: "boss", tools: [], handlers: {} });
+        await env.connect({ name: "mate", tools: [], handlers: {} });
+        await waitFor(() => env.core.agent("boss").connected && env.core.agent("mate").connected, 4000, "agents ready");
+        const sid = boss.createSession("plans");
+        const path = `/api/agents/boss/conversations/${sid}/messages`;
+        t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+        const start = Date.now();
+        const at = (minutes: number): string => `[${momentStamp(start + minutes * 60_000)}]`;
+
+        env.model.nextTurn(textTurn("on it"));
+        await (await env.stream("POST", path, { text: "plan my day" })).done;
+        assert.equal(newestUser(env.model, 0), `${at(0)}\nplan my day`);
+
+        // a follow-up typed mid-turn waits in the app and is sent after: stamped when it arrives, not when typed
+        t.mock.timers.setTime(start + 3 * 60_000);
+        env.model.nextTurn(textTurn("tomorrow too"));
+        await (await env.stream("POST", path, { text: "and tomorrow?" })).done;
+        assert.equal(newestUser(env.model, 1), `${at(3)}\nand tomorrow?`);
+        assert.deepEqual(sentMessages(env.model, 1)[0], sentMessages(env.model, 0)[0], "the system line did not move");
+
+        t.mock.timers.setTime(start + 9 * 60_000);
+        env.model.nextTurn(callTurn([{ id: "a1", name: "ask_mate", args: '{"task":"count the meetings"}' }]));
+        env.model.nextTurn(textTurn("three")); // mate's own turn, run inside the tool
+        env.model.nextTurn(textTurn("done"));
+        await env.core.runTurn({ agent: "boss", session: sid, text: "ask mate", attended: true, title: false });
+        assert.equal(newestUser(env.model, 2), `${at(9)}\nask mate`);
+        assert.equal(newestUser(env.model, 3), `${at(9)}\ncount the meetings`, "the delegate's turn opens on the task, stamped");
+        assert.equal(newestUser(env.model, 4), `${at(9)}\nask mate`);
+    } finally {
+        stopGates();
+        await env.stop();
+    }
+});
+
+test("a turn that waited on an approval goes on from the same prompt: the system line unchanged, its opening stamp still the newest", async (t) => {
+    const env = await boot();
+    try {
+        const h = await env.connect({
+            name: "toto",
+            tools: [{ name: "mail", description: "send the mail", writes: true }],
+            handlers: { mail: () => ({ text: "sent" }) },
+        });
+        await waitFor(() => env.core.registry.get("toto") !== undefined, 4000, "registration");
+        t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+        const start = Date.now();
+        env.model.nextTurn(callTurn([{ id: "m1", name: "mail" }]));
+        env.model.nextTurn(textTurn("mailed"));
+        const turn = env.core.runTurn({ agent: "toto", session: h.createSession("mail"), text: "mail them", attended: true, title: false });
+        await waitFor(() => env.core.approvals.pending().length === 1, 4000, "the approval");
+        t.mock.timers.setTime(start + 4 * 60_000);
+        env.core.approvals.answer(env.core.approvals.pending()[0]!.gate, { m1: true });
+        assert.equal((await turn).text, "mailed");
+
+        const [asked, resumed] = [sentMessages(env.model, 0), sentMessages(env.model, 1)];
+        assert.deepEqual(resumed[0], asked[0]);
+        assert.equal(newestUser(env.model, 1), `[${momentStamp(start)}]\nmail them`);
+        assert.deepEqual(resumed.at(-1), { role: "tool", tool_call_id: "m1", content: "sent" });
+    } finally {
+        await env.stop();
+    }
 });
 
 test("each user line carries the time it was stored — never an assistant, tool, system or summary line, never the log or the app", async () => {

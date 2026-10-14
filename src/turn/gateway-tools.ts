@@ -12,7 +12,7 @@ import {
 
 import { CHAIN_MAX_STEPS, substitute } from "./chain.ts";
 import { callerDenial, crossAgentDenial, recordInteraction, advanceInteraction, runA2a } from "./a2a.ts";
-import { nowStamp } from "./prompt.ts";
+import { momentStamp, nowStamp } from "./prompt.ts";
 import { isSessionId } from "./sessions.ts";
 import { peersOf } from "../registry/peers.ts";
 import type { GateContext } from "../gates/gate-types.ts";
@@ -186,14 +186,16 @@ function askOwnerTool(ctx: GatewayToolCtx): RuntimeTool {
             }
             const answers = await ctx.deps.gates.askOwner(ctx.gateCtx, questions);
             if (ctx.req.signal?.aborted) return { text: "Skipped: stopped by user." };
+            // the wait can run for hours past the turn's opening stamp: the result names when it ended
+            const at = momentStamp(Date.now());
             if (answers === null) {
                 return {
                     text:
-                        "The owner did not answer: they dismissed the questions or the wait ran out. Do not ask " +
+                        `The owner did not answer: they dismissed the questions or the wait ran out, on ${at}. Do not ask ` +
                         "them again; go on without the answers, or say what you still need.",
                 };
             }
-            const lines = ["The owner answered."];
+            const lines = [`The owner answered on ${at}.`];
             for (const [i, q] of questions.entries()) {
                 const answer = answers[i];
                 lines.push(`Q: ${q.question}`, `A: ${answer?.selected.join(", ") || "none of the options"}`);

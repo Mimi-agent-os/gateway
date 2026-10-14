@@ -11,6 +11,7 @@ import { Gates } from "../src/gates/gates.ts";
 import { parseAnswers, parseQuestions } from "../src/gates/questions.ts";
 import { buildRouter } from "../src/http/index.ts";
 import { gatewayToolNames } from "../src/turn/gateway-tools.ts";
+import { momentStamp } from "../src/turn/prompt.ts";
 import type { HubEvent } from "../src/events.ts";
 import { boot, callTurn, textTurn, waitFor, type Env } from "./harness-env.ts";
 import type { Harness } from "./agent-harness.ts";
@@ -191,7 +192,7 @@ test("an expired question resolves unanswered, on the turn stream and to the dev
     assert.ok(lines.some((l) => /expired in toto — the owner did not answer/.test(l)));
 });
 
-test("ask_owner parks the turn on a gate the Inbox lists, and the owner's picks resume it", async () => {
+test("ask_owner parks the turn on a gate the Inbox lists, and the owner's picks resume it", async (t) => {
     const env = await boot({ contextTokens: 4000 });
     try {
         await connected(env);
@@ -226,13 +227,16 @@ test("ask_owner parks the turn on a gate the Inbox lists, and the owner's picks 
         assert.equal(parked?.["kind"], "question");
         assert.equal(parked?.["tool"], "ask_owner");
 
+        t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
         const answered = await env.api("POST", `/api/approvals/${row.gate}/reply`, {
             answers: [{ selected: ["SQLite"] }, { selected: ["Audit", "Auth"], other: "and logs" }],
         });
         assert.deepEqual(answered.json, { ok: true });
         await turn.done;
 
-        const text = "The owner answered.\nQ: Which database?\nA: SQLite\nQ: Which features?\nA: Auth, Audit\nIn their own words: and logs";
+        const text =
+            `The owner answered on ${momentStamp(Date.now())}.\n` +
+            "Q: Which database?\nA: SQLite\nQ: Which features?\nA: Auth, Audit\nIn their own words: and logs";
         assert.equal(turn.lines.find((e) => e["type"] === "tool_result" && e["id"] === "q1")?.["text"], text);
         const sent = env.model.requests[1]?.["messages"] as Message[];
         assert.equal(sent.find((m) => m.role === "tool")?.content, text, "the model reads exactly that");
@@ -248,7 +252,7 @@ test("ask_owner parks the turn on a gate the Inbox lists, and the owner's picks 
     }
 });
 
-test("the reply route checks every answer against the gate's own options, and only a paired device may send it", async () => {
+test("the reply route checks every answer against the gate's own options, and only a paired device may send it", async (t) => {
     const env = await boot();
     try {
         const h = await connected(env);
@@ -283,10 +287,15 @@ test("the reply route checks every answer against the gate's own options, and on
         assert.equal(status, 403);
         assert.equal(env.core.approvals.pending().length, 1, "nothing refused settled the gate");
 
+        t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
         const ok = await env.api("POST", `/api/approvals/${gate}/reply`, { answers: [{ selected: ["Postgres"] }, { selected: [], other: "just auth" }] });
         assert.equal(ok.status, 200);
         await turn;
-        assert.equal(result(), "The owner answered.\nQ: Which database?\nA: Postgres\nQ: Which features?\nA: none of the options\nIn their own words: just auth");
+        assert.equal(
+            result(),
+            `The owner answered on ${momentStamp(Date.now())}.\n` +
+                "Q: Which database?\nA: Postgres\nQ: Which features?\nA: none of the options\nIn their own words: just auth",
+        );
         const late = await env.api<{ outcome: string }>("POST", `/api/approvals/${gate}/reply`, { dismiss: true });
         assert.equal(late.status, 409);
         assert.equal(late.json.outcome, "gone");
@@ -313,10 +322,32 @@ test("a dismissed question ends the wait: the agent hears the owner did not answ
         assert.deepEqual((await env.api("POST", `/api/approvals/${gate}/reply`, { dismiss: true })).json, { ok: true });
         await turn;
         assert.match(result() ?? "", UNANSWERED);
+        assert.match(result() ?? "", /ran out, on [A-Z][a-z]+day \d{4}-\d\d-\d\d \d\d:\d\d\. Do not ask them again/, "and when it ended");
         const settled = emitted.find((e) => e["type"] === "question_resolved");
         assert.equal(settled?.["outcome"], "dismissed");
         assert.equal(settled?.["answers"], null);
         assert.equal(hub.find((e) => e.type === "approval_resolved")?.["outcome"], "dismissed");
+    } finally {
+        await env.stop();
+    }
+});
+
+test("an answer hours into the wait names when it came, since the turn's opening stamp is no longer now", async (t) => {
+    const env = await boot();
+    try {
+        const h = await connected(env);
+        t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+        const opened = Date.now();
+        const { turn, result } = asking(env, h, ASK);
+        await waitFor(() => env.core.approvals.pending().length === 1, 4000, "the question gate");
+        t.mock.timers.setTime(opened + 9 * 3_600_000);
+        env.core.approvals.reply(env.core.approvals.pending()[0]!.gate, [{ selected: ["SQLite"] }, { selected: ["Auth"] }]);
+        await turn;
+
+        assert.match(result() ?? "", new RegExp(`^The owner answered on ${momentStamp(opened + 9 * 3_600_000)}\\.\\nQ: Which database\\?\\n`));
+        const sent = env.model.requests[1]?.["messages"] as Message[];
+        assert.equal(sent.findLast((m) => m.role === "user")?.content, `[${momentStamp(opened)}]\nset it up`, "the opening stamp is left as it was");
+        assert.equal(sent.at(-1)?.content, result(), "the model reads the later time last");
     } finally {
         await env.stop();
     }

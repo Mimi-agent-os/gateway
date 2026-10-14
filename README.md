@@ -83,7 +83,7 @@ Read from `$MIMI_HOME/.env` (dotenvx; keys saved from the app are encrypted); th
 
 | Name | Meaning |
 | --- | --- |
-| `MIMI_TZ` | your IANA time zone (`America/New_York`), default the host's; every "today" is a day in it, and every model reads its clock in it (the date in its prompt, the time on each message); the gateway checks it at boot and stops on an invalid name |
+| `MIMI_TZ` | your IANA time zone (`America/New_York`), default the host's; every "today" is a day in it, and every model reads its clock in it (the time on each message; the prompt names only the zone); the gateway checks it at boot and stops on an invalid name |
 | `MIMI_PUBLIC_URL` | the address the app dials from other networks (`https://mimi.example.com:8443`): a domain, a reverse proxy or a forwarded port, given as an http(s) URL and checked at boot like `MIMI_TZ`. A proxy on this host must set `X-Real-IP` to its client's address (nginx: `proxy_set_header X-Real-IP $remote_addr`): the per-address handshake limit counts a proxied client under that header |
 | `OPENROUTER_API_KEY` | the key every `openrouter` model shares |
 | `VLLM_API_KEY` | an optional key every `vllm` model shares |

@@ -97,6 +97,27 @@ test("the summarizer reads each user line with the time it was said, so a summar
     }
 });
 
+test("a compaction mid-turn keeps the turn's opening line, stamped, as the newest line the next round reads", async () => {
+    const env = await boot();
+    try {
+        const { h, sid } = await seeded(env);
+        env.model.nextTurn(callTurn([{ id: "t1", name: "get_time" }], 900));
+        env.model.nextTurn(textTurn("A short summary of the earlier part.", 50));
+        env.model.nextTurn(textTurn("answered"));
+
+        await env.core.runTurn({ agent: "toto", session: sid, text: "go", title: false });
+
+        assert.ok(h.sessions.get(sid)!.events.some((e) => e.type === "compaction"), "it compacted between the rounds");
+        const opening = env.core.sessions.entry("toto", sid)!.events.find((e) => e.type === "message" && (e.payload as Message).content === "go")!;
+        const next = env.model.requests[2]?.["messages"] as Message[];
+        assert.equal(next[1]?.content, "A short summary of the earlier part.");
+        assert.equal(next.findLast((m) => m.role === "user")?.content, `[${momentStamp(opening.createdAt)}]\ngo`);
+        assert.deepEqual(next.slice(-2).map((m) => m.role), ["assistant", "tool"], "the round it compacted after follows the opening line");
+    } finally {
+        await env.stop();
+    }
+});
+
 test("below the threshold nothing is compacted and no extra call is made", async () => {
     const env = await boot();
     try {

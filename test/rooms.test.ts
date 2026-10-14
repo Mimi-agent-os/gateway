@@ -314,12 +314,11 @@ test("rooms: the room turn runs the agent's own prompt, and its calls are accoun
         const session = h.createSession();
         env.model.nextTurn(textTurn("chat answer"));
         await env.core.runTurn({ agent: "dana", session, text: "hi", attended: true, title: false });
-        const chatSystem = String(lastPrompt(env)[0]?.content).split("\n\nCurrent date/time:")[0];
+        const chatSystem = lastPrompt(env)[0];
 
         env.model.nextTurn(textTurn("room answer"));
         await routed(env, room, "dana", "hi again");
-        const roomSystem = String(lastPrompt(env)[0]?.content).split("\n\nCurrent date/time:")[0];
-        assert.equal(roomSystem, chatSystem, "a room turn is the agent's own prompt, unchanged");
+        assert.deepEqual(lastPrompt(env)[0], chatSystem, "a room turn is the agent's own prompt, unchanged");
 
         const calls = env.db.listLlmCalls(10, "dana");
         const roomCall = calls.find((c) => c.room === room);

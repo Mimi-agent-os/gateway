@@ -70,8 +70,8 @@ test("runAgent: agent.json's description reaches the roster, and a pack's redesc
         const systems = env.model.requests.map((r) => (r["messages"] as Array<{ role: string; content: string }>)[0]!);
         assert.equal(systems.length, 2);
         assert.ok(systems.every((m) => m.role === "system"));
-        assert.match(systems[0]!.content, /^You are Toto\.\n\n- The owner has a cat\.\n\nCurrent date\/time: /);
-        assert.match(systems[1]!.content, /^You are Toto\.\n\n- The owner has a cat\.\n- The cat is called Miso\.\n\nCurrent date\/time: /);
+        assert.match(systems[0]!.content, /^You are Toto\.\n\n- The owner has a cat\.\n\nA bracketed line /);
+        assert.match(systems[1]!.content, /^You are Toto\.\n\n- The owner has a cat\.\n- The cat is called Miso\.\n\nA bracketed line /);
     } finally {
         await agent.stop();
         await env.stop();
