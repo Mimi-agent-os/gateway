@@ -268,8 +268,9 @@ export async function runTurn(deps: LoopDeps, req: TurnRequest): Promise<TurnOut
         const folded = deps.sessions.folded(cur);
         const plan = planSessionClose(folded, from, to);
         if (!plan) return;
-        const body = summary ?? toolTrafficSummary(folded, from, to);
-        await append([{ type: "compaction", payload: { summary: `[work folded] ${body}`, covers: plan.covers } }]);
+        // no bracketed tag: the model reads this as its own earlier line and copied a tag into its replies
+        const body = summary ?? `Earlier in this turn: ${toolTrafficSummary(folded, from, to)}.`;
+        await append([{ type: "compaction", payload: { summary: body, covers: plan.covers } }]);
     }
 
     async function stopped(results: EventBody[] = []): Promise<TurnOutcome> {

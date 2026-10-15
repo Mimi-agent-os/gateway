@@ -41,7 +41,7 @@ test("a turn that used only a fold tool, no `done`, folds its tool traffic mecha
 
         const comps = compactionsOf(h, sid);
         assert.equal(comps.length, 1, "the fold tool's traffic was folded");
-        assert.equal(comps[0]!.summary, "[work folded] 1 tool call: search");
+        assert.equal(comps[0]!.summary, "Earlier in this turn: 1 tool call: search.");
         assert.equal(env.model.requests.length, 2, "no summarize model call — the fold is mechanical");
     } finally {
         await env.stop();
@@ -79,7 +79,7 @@ test("`done` wins over auto-fold: the fold carries the model's summary, not the 
 
         const comps = compactionsOf(h, sid);
         assert.equal(comps.length, 1);
-        assert.equal(comps[0]!.summary, "[work folded] Found the thing.");
+        assert.equal(comps[0]!.summary, "Found the thing.");
         assert.doesNotMatch(comps[0]!.summary, /tool call/, "rule 1 wins, not the mechanical summary");
     } finally {
         await env.stop();
@@ -116,14 +116,14 @@ test("auto-fold waits for the turn's end: the model reads the fold tool's result
             "round 2 was asked with the tool's output, not a folded stub",
         );
         assert.equal(out.text, "the answer is SEARCHED");
-        assert.deepEqual(compactionsOf(h, sid).map((c) => c.summary), ["[work folded] 1 tool call: search"]);
+        assert.deepEqual(compactionsOf(h, sid).map((c) => c.summary), ["Earlier in this turn: 1 tool call: search."]);
         const entry = await env.core.sessions.ensure("toto", sid);
         const history = env.core.sessions.history(entry);
         assert.deepEqual(
             history.map((m) => [m.role, m.content]),
             [
                 ["user", `[${momentStamp(entry.events[0]!.createdAt)}]\ngo`],
-                ["assistant", "[work folded] 1 tool call: search"],
+                ["assistant", "Earlier in this turn: 1 tool call: search."],
                 ["assistant", "the answer is SEARCHED"],
             ],
         );
@@ -149,12 +149,12 @@ test("a `done` after a mid-turn compaction folds only what came after it: the co
         await env.core.runTurn({ agent: "toto", session: sid, text: "go", title: false });
 
         const comps = compactionsOf(h, sid);
-        assert.deepEqual(comps.map((c) => c.summary), ["EARLIER SUMMARY", "[work folded] Wrapped up."]);
+        assert.deepEqual(comps.map((c) => c.summary), ["EARLIER SUMMARY", "Wrapped up."]);
         const midTurn = h.sessions.get(sid)!.events.find((e) => e.type === "compaction")!.seq;
         assert.ok(comps[1]!.covers![0] > midTurn, "the fold range starts after the compaction event");
         const history = env.core.sessions.history(await env.core.sessions.ensure("toto", sid));
         assert.equal(history[0]?.content, "EARLIER SUMMARY", "the earlier conversation is still summarized");
-        assert.ok(history.some((m) => m.content === "[work folded] Wrapped up."));
+        assert.ok(history.some((m) => m.content === "Wrapped up."));
         assert.equal(history.at(-1)?.content, "finished");
     } finally {
         await env.stop();
@@ -185,7 +185,7 @@ test("an image fold before the first call leaves the turn's own tool run to fold
         const comps = compactionsOf(h, sid);
         assert.deepEqual(comps.map((c) => [c.summary, c.images?.map((i) => [i.seq, i.notes.length])]), [
             [undefined, [[1, 20]]],
-            ["[work folded] 1 tool call: search", undefined],
+            ["Earlier in this turn: 1 tool call: search.", undefined],
         ]);
         const history = env.core.sessions.history(await env.core.sessions.ensure("toto", sid));
         assert.ok(history[0]?.content?.endsWith("[earlier image: shot 4]"));
