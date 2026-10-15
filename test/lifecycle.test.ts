@@ -154,7 +154,7 @@ test("pausing an agent cuts the model call it has running and drops the ones it 
     const env = await boot();
     const stalled = stalledModel();
     try {
-        addModel({ name: "stall", provider: "llamacpp", endpoint: await stalled.listen(), contextTokens: 1000 }, env.db);
+        addModel({ name: "stall", provider: "llamacpp", endpoint: await stalled.listen(), contextTokens: 1000, maxParallel: 1 }, env.db);
         setDefaultModel("stall", env.db);
         const h = await connected(env, { name: "toto", tools: [], handlers: {} });
         const ids = await pipelined(env, h, stalled);
@@ -185,7 +185,7 @@ test("revoking an agent's pin cuts the model calls it left behind", async () => 
     const env = await boot();
     const stalled = stalledModel();
     try {
-        addModel({ name: "stall", provider: "llamacpp", endpoint: await stalled.listen(), contextTokens: 1000 }, env.db);
+        addModel({ name: "stall", provider: "llamacpp", endpoint: await stalled.listen(), contextTokens: 1000, maxParallel: 1 }, env.db);
         setDefaultModel("stall", env.db);
         const h = await connected(env, { name: "toto", tools: [], handlers: {} });
         await pipelined(env, h, stalled);

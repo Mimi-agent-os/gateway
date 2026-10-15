@@ -117,9 +117,10 @@ export async function autoTitle(opts: AutoTitleOptions): Promise<boolean> {
             let sent = null as AbortSignal | null;
             let failed: unknown = null;
             try {
-                // the same per-endpoint queue as every turn: a one-slot server never sees two calls
+                // the same per-model queue as every turn: the model's parallel-call limit holds for titles too
                 await enqueueCall(
-                    cfg.endpointUrl,
+                    cfg,
+                    db,
                     () => {
                         // the same gate as every other call of this agent, at dequeue: pause, grant, daily limit
                         admitAtDequeue(agent, cfg, db);

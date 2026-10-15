@@ -56,6 +56,8 @@ export interface ModelRow extends ModelPricing {
     /** Stored 0/1; the model accepts images (data-URIs) alongside text. */
     vision: boolean;
     params: Record<string, unknown>;
+    /** At most this many calls of the model at once; null runs every call at once. */
+    maxParallel: number | null;
     /** Minted once, immutable, opaque: the alias can be renamed, this is what usage is keyed by. */
     modelUid: string;
     createdAt: string;
@@ -293,6 +295,8 @@ CREATE TABLE IF NOT EXISTS models (
     context_tokens INTEGER NOT NULL,
     vision         INTEGER NOT NULL DEFAULT 0,
     params         TEXT NOT NULL,
+    -- null = no parallel-call limit
+    max_parallel   INTEGER,
     model_uid      TEXT NOT NULL UNIQUE,
     created_at     TEXT NOT NULL DEFAULT (datetime('now')),
     price_in_per_m  REAL NOT NULL DEFAULT 0,
@@ -525,6 +529,7 @@ function toModelRow(r: Record<string, unknown>): ModelRow {
         contextTokens: Number(r["context_tokens"]),
         vision: Number(r["vision"]) !== 0,
         params: JSON.parse(String(r["params"])) as Record<string, unknown>,
+        maxParallel: numCol(r["max_parallel"]),
         modelUid: String(r["model_uid"]),
         createdAt: String(r["created_at"]),
         priceInPerM: Number(r["price_in_per_m"]),
@@ -845,8 +850,8 @@ export class GatewayDb {
     insertModel(row: Omit<ModelRow, "modelUid" | "createdAt" | keyof ModelPricing>): void {
         this.db
             .prepare(
-                `INSERT INTO models (name, provider, endpoint, model_id, context_tokens, vision, params, model_uid)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+                `INSERT INTO models (name, provider, endpoint, model_id, context_tokens, vision, params, max_parallel, model_uid)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             )
             .run(
                 row.name,
@@ -856,6 +861,7 @@ export class GatewayDb {
                 row.contextTokens,
                 row.vision ? 1 : 0,
                 JSON.stringify(row.params),
+                row.maxParallel,
                 randomBytes(16).toString("hex"),
             );
     }
@@ -863,10 +869,10 @@ export class GatewayDb {
     updateModel(name: string, row: Omit<ModelRow, "name" | "modelUid" | "createdAt" | keyof ModelPricing>): void {
         const r = this.db
             .prepare(
-                `UPDATE models SET provider = ?, endpoint = ?, model_id = ?, context_tokens = ?, vision = ?, params = ?
+                `UPDATE models SET provider = ?, endpoint = ?, model_id = ?, context_tokens = ?, vision = ?, params = ?, max_parallel = ?
                  WHERE name = ?`,
             )
-            .run(row.provider, row.endpoint, row.modelId, row.contextTokens, row.vision ? 1 : 0, JSON.stringify(row.params), name);
+            .run(row.provider, row.endpoint, row.modelId, row.contextTokens, row.vision ? 1 : 0, JSON.stringify(row.params), row.maxParallel, name);
         if (Number(r.changes) === 0) throw new Error(`gateway.db: no model "${name}".`);
     }
 
@@ -878,6 +884,14 @@ export class GatewayDb {
             )
             .run(p.priceInPerM, p.priceOutPerM, p.limit?.unit ?? null, p.limit?.value ?? null, name);
         if (Number(r.changes) === 0) throw new Error(`gateway.db: no model "${name}".`);
+    }
+
+    /** By identity, so a rename never loses it; null = no limit, or no such model. */
+    maxParallel(modelUid: string): number | null {
+        const r = this.db.prepare(`SELECT max_parallel FROM models WHERE model_uid = ?`).get(modelUid) as
+            | { max_parallel: number | null }
+            | undefined;
+        return numCol(r?.max_parallel);
     }
 
     renameModel(from: string, to: string): void {

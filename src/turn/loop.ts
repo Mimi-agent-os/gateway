@@ -108,7 +108,6 @@ export async function runTurn(deps: LoopDeps, req: TurnRequest): Promise<TurnOut
     }
     let provider = createProvider(cfg.name, deps.db);
     let thresholds = thresholdsFor(cfg, deps.db);
-    let queueKey = cfg.endpointUrl;
     let usedFallback = false;
     const priority: CallPriority = req.priority ?? "interactive";
     const deadlineMs = req.invokeDeadlineMs;
@@ -422,7 +421,8 @@ export async function runTurn(deps: LoopDeps, req: TurnRequest): Promise<TurnOut
             const sent = visibleTo(cfg.vision, history);
             try {
                 await enqueueCall(
-                    queueKey,
+                    cfg,
+                    deps.db,
                     async () => {
                         // the gate binds at DEQUEUE too: what ran ahead of this call may have spent
                         // the model's limit while this one waited in the queue
@@ -538,7 +538,6 @@ export async function runTurn(deps: LoopDeps, req: TurnRequest): Promise<TurnOut
             cfg = fallbackCfg;
             provider = createProvider(cfg.name, deps.db);
             thresholds = thresholdsFor(cfg, deps.db);
-            queueKey = cfg.endpointUrl;
             // the dead attempt's text/thinking already reached the client: this says drop them,
             // because what follows is a replacement answer, not a continuation
             emit?.({ type: "restart", reason: "fallback", model: cfg.name });

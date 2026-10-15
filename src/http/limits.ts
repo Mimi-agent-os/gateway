@@ -4,7 +4,8 @@ import { tokenCost, type GatewayDb } from "../store/db.ts";
 import { dayInfo } from "../store/day.ts";
 import { json, readBody, type Router } from "./router.ts";
 
-/** Prices and the limit live on the registry row, never in /api/models; `today` is all agents and pings, priced now. */
+/** Prices and the daily limit live on the registry row, never in /api/models; `maxParallel` is shown beside them but set
+ *  through PATCH /api/models; `today` is all agents and pings, priced now. */
 const limitRow = (m: ModelConfig, spent: ReturnType<GatewayDb["modelTokens"]>): Record<string, unknown> => {
     const { promptTokens, completionTokens } = spent.get(m.modelUid) ?? { promptTokens: 0, completionTokens: 0 };
     return {
@@ -14,6 +15,7 @@ const limitRow = (m: ModelConfig, spent: ReturnType<GatewayDb["modelTokens"]>): 
         priceInPerM: m.priceInPerM,
         priceOutPerM: m.priceOutPerM,
         limit: m.limit,
+        maxParallel: m.maxParallel,
         today: { tokens: promptTokens + completionTokens, promptTokens, completionTokens, cost: tokenCost(promptTokens, completionTokens, m) },
         day: dayInfo(),
     };

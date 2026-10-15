@@ -60,7 +60,13 @@ Moving an agent between a local and a cloud model is a setting in the app.
 
 Prices (dollars per 1M tokens) and daily limits (tokens or dollars) are set per model in the app under Settings,
 Limits & prices. A limit caps one model for all agents per day in `MIMI_TZ` and resets at midnight; past it, the
-call goes to the agent's fallback model when one is set, and is refused otherwise.
+call goes to the agent's fallback model when one is set, and is refused otherwise. Each call is checked as it starts,
+so calls already running when the limit is reached still finish.
+
+Parallel calls are set there too. With none set, every call goes to the model at once (vLLM and OpenRouter take many).
+Set a number for a server that takes only a few calls at once, such as llama.cpp with few slots: that many calls of
+the model run at once, and the rest wait in order, your chat turns ahead of titles, compaction and agents' own calls.
+The number counts per model, so two models on one server each have their own.
 
 ## Approvals and questions
 

@@ -93,6 +93,37 @@ test("models: the vision flag round-trips over the HTTP surface and defaults fal
     }
 });
 
+test("models: maxParallel is set on create and patch, cleared with null, and refused with a clear error", async () => {
+    const env = await boot({ contextTokens: 4000 });
+    const base = { provider: "llamacpp", endpoint: "http://x", contextTokens: 1000 };
+    const limitOf = async (name: string): Promise<number | null | undefined> =>
+        (await env.api<Array<{ name: string; maxParallel: number | null }>>("GET", "/api/models")).json.find((m) => m.name === name)?.maxParallel;
+    try {
+        assert.equal(await limitOf("fake"), null, "no limit until the owner sets one");
+        assert.equal((await env.api("POST", "/api/models", { ...base, name: "few", maxParallel: 2 })).status, 201);
+        assert.equal(await limitOf("few"), 2);
+
+        const refused = await env.api<{ error: string }>("POST", "/api/models", { ...base, name: "zero", maxParallel: 0 });
+        assert.equal(refused.status, 400);
+        assert.equal(refused.json.error, 'models: model "zero" — "maxParallel" must be a whole number from 1 to 256, or null for no limit.');
+        for (const maxParallel of ["3", 257, 2.5, false]) {
+            const result = await env.api<{ error: string }>("PATCH", "/api/models/few", { maxParallel });
+            assert.equal(result.status, 400, JSON.stringify(maxParallel));
+            assert.match(result.json.error, /"maxParallel" must be a whole number from 1 to 256/);
+        }
+        assert.equal(await limitOf("few"), 2, "a refused patch changes nothing");
+
+        assert.equal((await env.api("PATCH", "/api/models/few", { maxParallel: 4 })).status, 200);
+        assert.equal(await limitOf("few"), 4);
+        const limits = (await env.api<Array<{ name: string; maxParallel: number | null }>>("GET", "/api/limits")).json;
+        assert.equal(limits.find((m) => m.name === "few")?.maxParallel, 4, "the Limits & prices rows show it too");
+        assert.equal((await env.api("PATCH", "/api/models/few", { maxParallel: null })).status, 200);
+        assert.equal(await limitOf("few"), null);
+    } finally {
+        await env.stop();
+    }
+});
+
 test("models: contextTokens must be a JSON number", async () => {
     const env = await boot({ contextTokens: 4000 });
     try {

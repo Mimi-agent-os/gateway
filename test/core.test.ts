@@ -6,7 +6,7 @@ import test from "node:test";
 
 import type { ChatOkPayload, Message, StreamEvent } from "@mimi-os/protocol";
 import { fakeIdentity } from "@mimi-os/sdk/testing";
-import { setModelPricing } from "../src/llm/models.ts";
+import { patchModel, setModelPricing } from "../src/llm/models.ts";
 import { boot, callTurn, textTurn, waitFor } from "./harness-env.ts";
 import type { Env } from "./harness-env.ts";
 import type { Harness } from "./agent-harness.ts";
@@ -1050,6 +1050,8 @@ test("a spent daily model limit stops the calls one socket pipelined against it"
     try {
         const h = await connected(env, { name: "toto", tools: [], handlers: {} });
         setModelPricing("fake", { limit: { unit: "tokens", value: 10 } }, env.db);
+        // one at a time, so each later call starts after the first one's usage is on the day's tally
+        patchModel("fake", { maxParallel: 1 }, env.db);
         for (let i = 0; i < 4; i++) env.model.nextTurn(textTurn("hi"));
 
         const ids = ["c1", "c2", "c3", "c4"];

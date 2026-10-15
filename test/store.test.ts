@@ -165,12 +165,12 @@ test("a call whose usage is not a number is still charged for the numbers that a
 test("prices and the daily limit persist on the model row, apart from its base settings", () => {
     const { db, dir, cleanup } = freshDb();
     try {
-        db.insertModel({ name: "m", provider: "llamacpp", endpoint: "http://127.0.0.1:1", modelId: null, contextTokens: 1000, vision: false, params: {} });
+        db.insertModel({ name: "m", provider: "llamacpp", endpoint: "http://127.0.0.1:1", modelId: null, contextTokens: 1000, vision: false, params: {}, maxParallel: null });
         const fresh = db.getModel("m")!;
         assert.deepEqual([fresh.priceInPerM, fresh.priceOutPerM, fresh.limit], [0, 0, null], "free and unlimited until the owner says otherwise");
 
         db.setModelPricing("m", { priceInPerM: 0.5, priceOutPerM: 1.25, limit: { unit: "usd", value: 3 } });
-        db.updateModel("m", { provider: "llamacpp", endpoint: "http://127.0.0.1:2", modelId: null, contextTokens: 2000, vision: false, params: {} });
+        db.updateModel("m", { provider: "llamacpp", endpoint: "http://127.0.0.1:2", modelId: null, contextTokens: 2000, vision: false, params: {}, maxParallel: null });
         const reopened = new GatewayDb(join(dir, "home", "gateway.db"));
         try {
             const row = reopened.getModel("m")!;

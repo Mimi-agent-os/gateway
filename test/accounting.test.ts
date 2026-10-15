@@ -487,21 +487,41 @@ test("an estimate counts each image as IMAGE_TOKENS, never its base64, and never
     assert.equal(estimateUsage(album, [], "").promptTokens, estimateUsage([{ role: "user", content: "" }], [], "").promptTokens + 32 * IMAGE_TOKENS);
 });
 
-test("a call stopped while it waits in the queue never reached the provider and spends nothing", async () => {
+test("a model with no parallel-call limit takes two turns at once, and nothing queues", async () => {
     const env = await boot({ contextTokens: 100_000 });
     const hanging = await hangingModel();
     try {
         const h = await agentUp(env, "alfa");
         addModel({ name: "slow", provider: "llamacpp", endpoint: hanging.url, contextTokens: 100_000 }, env.db);
         setDefaultModel("slow", env.db);
+        const one = env.core.turns.start({ agent: "alfa", session: h.createSession("a", true), text: "one", title: false });
+        const two = env.core.turns.start({ agent: "alfa", session: h.createSession("b", true), text: "two", title: false });
+        await waitFor(() => hanging.requests() === 2, 4000, "both calls to reach the model");
+        assert.equal(waitingCalls(getModel("slow", env.db)!.modelUid), 0);
+        one.stop();
+        two.stop();
+        await Promise.all([one.result, two.result]);
+    } finally {
+        await hanging.close();
+        await env.stop();
+    }
+});
+
+test("a call stopped while it waits in the queue never reached the provider and spends nothing", async () => {
+    const env = await boot({ contextTokens: 100_000 });
+    const hanging = await hangingModel();
+    try {
+        const h = await agentUp(env, "alfa");
+        addModel({ name: "slow", provider: "llamacpp", endpoint: hanging.url, contextTokens: 100_000, maxParallel: 1 }, env.db);
+        setDefaultModel("slow", env.db);
         const a = h.createSession("a", true);
         const b = h.createSession("b", true);
         const busy = env.core.turns.start({ agent: "alfa", session: a, text: "hold the slot", title: false });
         await waitFor(() => hanging.requests() === 1, 4000, "the slot to be taken");
         const queued = env.core.turns.start({ agent: "alfa", session: b, text: "wait", title: false });
-        await waitFor(() => waitingCalls(hanging.url) === 1, 4000, "the second call to queue behind the first");
+        await waitFor(() => waitingCalls(getModel("slow", env.db)!.modelUid) === 1, 4000, "the second call to queue behind the first");
         queued.stop();
-        await waitFor(() => waitingCalls(hanging.url) === 0, 4000, "the stopped call to leave the queue");
+        await waitFor(() => waitingCalls(getModel("slow", env.db)!.modelUid) === 0, 4000, "the stopped call to leave the queue");
         await queued.result;
         busy.stop();
         await busy.result;
@@ -526,7 +546,7 @@ test("a limit spent while a call waits in the queue hands that call to the fallb
     const hanging = await hangingModel();
     try {
         const h = await agentUp(env, "alfa");
-        addModel({ name: "slow", provider: "llamacpp", endpoint: hanging.url, contextTokens: 100_000 }, env.db);
+        addModel({ name: "slow", provider: "llamacpp", endpoint: hanging.url, contextTokens: 100_000, maxParallel: 1 }, env.db);
         setModelPricing("slow", { limit: { unit: "tokens", value: 1000 } }, env.db);
         env.db.setModelsPolicy("alfa", { allowed: ["slow", "fake"], primary: "slow", fallback: "fake" });
         const a = h.createSession("a", true);
@@ -534,7 +554,7 @@ test("a limit spent while a call waits in the queue hands that call to the fallb
         const busy = env.core.turns.start({ agent: "alfa", session: a, text: "hold the slot", title: false });
         await waitFor(() => hanging.requests() === 1, 4000, "the slot to be taken");
         const queued = env.core.turns.start({ agent: "alfa", session: b, text: "wait", title: false });
-        await waitFor(() => waitingCalls(hanging.url) === 1, 4000, "the second call to queue behind the first");
+        await waitFor(() => waitingCalls(getModel("slow", env.db)!.modelUid) === 1, 4000, "the second call to queue behind the first");
         // another agent spends the model's day while this call still waits
         recordLlmCall(
             { agent: "beta", scope: "beta", callId: newCallId(), callKind: "oneshot", modelUid: getModel("slow", env.db)!.modelUid, registryModel: "slow", usage: { promptTokens: 5000, completionTokens: 0, totalTokens: 5000, cachedTokens: 0 }, raw: {} },

@@ -1,8 +1,10 @@
-/** One serialized FIFO queue per model endpoint; interactive jobs jump ahead of background ones. */
+/** One queue per model: up to its parallel-call limit run at once, the rest wait with interactive jobs ahead of background ones. */
+import type { GatewayDb } from "../store/db.ts";
+import type { ModelConfig } from "./models.ts";
 
 export type CallPriority = "interactive" | "background";
 
-/** Rejection from a saturated endpoint queue — the call never ran, so it spent nothing. */
+/** Rejection from a model's full queue — the call never ran, so it spent nothing. */
 export class QueueFullError extends Error {}
 
 /** Each waiting job pins the payload its caller sent — an agent loop must not queue them without end. */
@@ -19,20 +21,25 @@ interface QueuedJob<T> {
 class ModelQueue {
     private readonly interactive: QueuedJob<unknown>[] = [];
     private readonly background: QueuedJob<unknown>[] = [];
-    private running = false;
+    private running = 0;
+    private readonly modelUid: string;
+    private readonly db: GatewayDb;
+
+    constructor(modelUid: string, db: GatewayDb) {
+        this.modelUid = modelUid;
+        this.db = db;
+    }
 
     get waiting(): number {
         return this.interactive.length + this.background.length;
     }
 
-    enqueue<T>(run: () => Promise<T>, priority: CallPriority, signal?: AbortSignal): Promise<T> {
+    enqueue<T>(model: string, run: () => Promise<T>, priority: CallPriority, signal?: AbortSignal): Promise<T> {
         if (signal?.aborted) return Promise.reject(signal.reason);
         const pending = priority === "interactive" ? this.interactive : this.background;
         if (pending.length >= MAX_WAITING) {
             return Promise.reject(
-                new QueueFullError(
-                    `model endpoint busy: ${MAX_WAITING} ${priority} calls already waiting`,
-                ),
+                new QueueFullError(`model "${model}" busy: ${MAX_WAITING} ${priority} calls already waiting`),
             );
         }
         return new Promise<T>((resolve, reject) => {
@@ -56,48 +63,54 @@ class ModelQueue {
         });
     }
 
-    private drain(): void {
-        if (this.running) return;
-        const job = this.interactive.shift() ?? this.background.shift();
-        if (!job) return;
-        this.running = true;
-        job.removeAbort?.();
-        Promise.resolve()
-            .then(() => {
-                job.signal?.throwIfAborted();
-                return job.run();
-            })
-            .then(
-            (v) => {
-                job.resolve(v);
-                this.running = false;
-                this.drain();
-            },
-            (e: unknown) => {
-                job.reject(e);
-                this.running = false;
-                this.drain();
-            },
-        );
+    drain(): void {
+        // the limit is read at every drain: a change applies from the next start and never stops a running call
+        let limit = Infinity;
+        try {
+            limit = this.db.maxParallel(this.modelUid) ?? Infinity;
+        } catch {
+            // a database closed at shutdown must not throw out of a settled call's finally
+        }
+        while (this.waiting > 0 && this.running < limit) {
+            const job = this.interactive.shift() ?? this.background.shift();
+            if (!job) break;
+            this.running++;
+            job.removeAbort?.();
+            Promise.resolve()
+                .then(() => {
+                    job.signal?.throwIfAborted();
+                    return job.run();
+                })
+                .then(job.resolve, job.reject)
+                .finally(() => {
+                    this.running--;
+                    this.drain();
+                });
+        }
+        if (this.running === 0 && this.waiting === 0) queues.delete(this.modelUid);
     }
 }
 
 const queues = new Map<string, ModelQueue>();
 
-/** Run `call` serialized against every other call queued for the same endpoint. */
+/** Run `call` within the model's parallel-call limit; with no limit it starts at once. */
 export function enqueueCall<T>(
-    endpoint: string,
+    model: ModelConfig,
+    db: GatewayDb,
     call: () => Promise<T>,
-    priority: CallPriority = "background",
+    priority: CallPriority,
     signal?: AbortSignal,
 ): Promise<T> {
-    let queue = queues.get(endpoint);
+    let queue = queues.get(model.modelUid);
     if (!queue) {
-        queue = new ModelQueue();
-        queues.set(endpoint, queue);
+        queue = new ModelQueue(model.modelUid, db);
+        queues.set(model.modelUid, queue);
     }
-    return queue.enqueue(call, priority, signal);
+    return queue.enqueue(model.name, call, priority, signal);
 }
 
-/** Calls queued for `endpoint` that have not started yet. */
-export const waitingCalls = (endpoint: string): number => queues.get(endpoint)?.waiting ?? 0;
+/** A raised limit starts the calls it now lets through without waiting for a running one to end. */
+export const parallelLimitChanged = (modelUid: string): void => queues.get(modelUid)?.drain();
+
+/** Calls queued for the model that have not started yet. */
+export const waitingCalls = (modelUid: string): number => queues.get(modelUid)?.waiting ?? 0;

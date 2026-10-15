@@ -18,7 +18,7 @@ import { LlamaProvider } from "../src/llm/providers/llama-cpp/index.ts";
 import { OpenRouterProvider } from "../src/llm/providers/openrouter/index.ts";
 import { parseSSE, postSSE, toWireMessages } from "../src/llm/providers/shared/openai-sse.ts";
 import type { WireChunk } from "../src/llm/providers/shared/openai-sse.ts";
-import { enqueueCall, QueueFullError } from "../src/llm/queue.ts";
+import { enqueueCall, QueueFullError, waitingCalls } from "../src/llm/queue.ts";
 
 checkEnv();
 
@@ -451,75 +451,206 @@ test("parseSSE gives up on a body that stops sending, keeping what already arriv
     }
 });
 
-test("a synchronous queued failure does not wedge the endpoint for the next call", async () => {
-    const endpoint = `queue-test-${Date.now()}-${Math.random()}`;
-    await assert.rejects(enqueueCall(endpoint, () => {
-        throw new Error("broken job");
-    }), /broken job/);
-    assert.equal(await enqueueCall(endpoint, async () => "next"), "next");
+// ── the per-model queue: a parallel-call limit the owner sets, none by default ─────────────
+
+const queueDb = gatewayDb(dbPath("queue"));
+let queueModels = 0;
+
+/** A fresh registry model on one shared server: each alias has its own queue and limit. */
+function queueModel(maxParallel: number | null): models.ModelConfig {
+    const name = `q${++queueModels}`;
+    models.addModel({ name, provider: "llamacpp", endpoint: "http://box:8000", contextTokens: 1000, maxParallel }, queueDb);
+    return models.getModel(name, queueDb)!;
+}
+
+/** Calls that log their start and hold their slot until released. */
+function heldCalls(): { started: string[]; call: (label: string) => () => Promise<string>; release: (label: string) => void } {
+    const started: string[] = [];
+    const gates = new Map<string, PromiseWithResolvers<void>>();
+    return {
+        started,
+        call: (label) => {
+            const gate = Promise.withResolvers<void>();
+            gates.set(label, gate);
+            return async () => {
+                started.push(label);
+                await gate.promise;
+                return label;
+            };
+        },
+        release: (label) => gates.get(label)!.resolve(),
+    };
+}
+
+test("with no limit every call reaches the model at once, past the waiting cap, and nothing waits", async () => {
+    const model = queueModel(null);
+    const h = heldCalls();
+    const labels = Array.from({ length: 100 }, (_, i) => `c${i}`);
+    const calls = labels.map((label, i) => enqueueCall(model, queueDb, h.call(label), i % 2 ? "interactive" : "background"));
+    await settle();
+    assert.equal(h.started.length, 100);
+    assert.equal(waitingCalls(model.modelUid), 0);
+    for (const label of labels) h.release(label);
+    assert.deepEqual(await Promise.all(calls), labels);
 });
 
-test("an aborted queued call is removed without releasing the running endpoint slot", async () => {
-    const endpoint = `queue-abort-${Date.now()}-${Math.random()}`;
-    const release = Promise.withResolvers<void>();
-    const started = Promise.withResolvers<void>();
-    const running = enqueueCall(endpoint, async () => {
-        started.resolve();
-        await release.promise;
-        return "first";
-    });
-    await started.promise;
+test("limit 1 runs one call at a time, an interactive call ahead of the background ones that waited longer", async () => {
+    const model = queueModel(1);
+    const h = heldCalls();
+    const first = enqueueCall(model, queueDb, h.call("first"), "background");
+    const titles = enqueueCall(model, queueDb, h.call("title"), "background");
+    const compaction = enqueueCall(model, queueDb, h.call("compaction"), "background");
+    const turn = enqueueCall(model, queueDb, h.call("turn"), "interactive");
+    await settle();
+    assert.deepEqual(h.started, ["first"]);
+    assert.equal(waitingCalls(model.modelUid), 3);
+    for (const [label, done] of [["first", first], ["turn", turn], ["title", titles], ["compaction", compaction]] as const) {
+        h.release(label);
+        assert.equal(await done, label);
+        await settle();
+    }
+    assert.deepEqual(h.started, ["first", "turn", "title", "compaction"]);
+});
+
+test("limit 3 runs three at once and starts the next one as soon as one finishes", async () => {
+    const model = queueModel(3);
+    const h = heldCalls();
+    const calls = ["a", "b", "c", "d", "e"].map((label) => enqueueCall(model, queueDb, h.call(label), "background"));
+    await settle();
+    assert.deepEqual(h.started, ["a", "b", "c"]);
+    assert.equal(waitingCalls(model.modelUid), 2);
+    h.release("b");
+    await settle();
+    assert.deepEqual(h.started, ["a", "b", "c", "d"]);
+    for (const label of ["a", "c", "d", "e"]) h.release(label);
+    assert.deepEqual(await Promise.all(calls), ["a", "b", "c", "d", "e"]);
+    assert.equal(waitingCalls(model.modelUid), 0);
+});
+
+test("the limit counts per model: two aliases of one server each run their own, and a rename keeps the queue", async () => {
+    const one = queueModel(1);
+    const other = queueModel(1);
+    assert.equal(one.endpointUrl, other.endpointUrl);
+    const h = heldCalls();
+    const a = enqueueCall(one, queueDb, h.call("one"), "background");
+    const b = enqueueCall(other, queueDb, h.call("other"), "background");
+    await settle();
+    assert.deepEqual(h.started, ["one", "other"]);
+
+    models.patchModel(one.name, { name: `${one.name}-renamed` }, queueDb);
+    const renamed = models.getModel(`${one.name}-renamed`, queueDb)!;
+    const next = enqueueCall(renamed, queueDb, h.call("renamed"), "interactive");
+    await settle();
+    assert.equal(waitingCalls(renamed.modelUid), 1, "the renamed model's call waits behind the one it already runs");
+    for (const label of ["one", "other", "renamed"]) h.release(label);
+    assert.deepEqual(await Promise.all([a, b, next]), ["one", "other", "renamed"]);
+});
+
+test("a synchronous queued failure does not wedge the model for the next call", async () => {
+    const model = queueModel(1);
+    await assert.rejects(enqueueCall(model, queueDb, () => {
+        throw new Error("broken job");
+    }, "background"), /broken job/);
+    assert.equal(await enqueueCall(model, queueDb, async () => "next", "background"), "next");
+});
+
+test("an aborted waiting call leaves the queue without releasing the running call's slot", async () => {
+    const model = queueModel(1);
+    const h = heldCalls();
+    const running = enqueueCall(model, queueDb, h.call("first"), "background");
+    await settle();
 
     const abort = new AbortController();
-    let ran = false;
-    const cancelled = enqueueCall(
-        endpoint,
-        async () => {
-            ran = true;
-            return "cancelled";
-        },
-        "interactive",
-        abort.signal,
-    );
+    const cancelled = enqueueCall(model, queueDb, h.call("cancelled"), "interactive", abort.signal);
+    assert.equal(waitingCalls(model.modelUid), 1);
     abort.abort(new Error("turn stopped"));
     await assert.rejects(cancelled, /turn stopped/);
+    assert.equal(waitingCalls(model.modelUid), 0);
 
-    let nextRan = false;
-    const next = enqueueCall(endpoint, async () => {
-        nextRan = true;
-        return "next";
-    });
-    await Promise.resolve();
-    assert.equal(nextRan, false, "the running call keeps the endpoint slot");
-    release.resolve();
+    const next = enqueueCall(model, queueDb, h.call("next"), "background");
+    await settle();
+    assert.deepEqual(h.started, ["first"], "the running call keeps the slot");
+    h.release("first");
+    h.release("next");
     assert.equal(await running, "first");
-    assert.equal(ran, false);
     assert.equal(await next, "next");
+    assert.deepEqual(h.started, ["first", "next"], "the stopped call never ran");
 });
 
-test("a full endpoint queue refuses new background calls instead of pinning their payloads", async () => {
-    const endpoint = `http://queue-cap-${Date.now()}`;
-    const release = Promise.withResolvers<void>();
-    const started = Promise.withResolvers<void>();
-    const running = enqueueCall(endpoint, async () => {
-        started.resolve();
-        await release.promise;
-        return "first";
-    });
-    await started.promise;
+test("a changed limit applies to the next start and never stops a running call", async () => {
+    const model = queueModel(1);
+    const h = heldCalls();
+    const calls = ["a", "b", "c"].map((label) => enqueueCall(model, queueDb, h.call(label), "background"));
+    await settle();
+    assert.deepEqual(h.started, ["a"]);
 
-    const flood = Array.from({ length: 500 }, () => enqueueCall(endpoint, async () => "queued"));
+    // raised: what it now lets through starts at once, beside the call already running
+    models.patchModel(model.name, { maxParallel: 3 }, queueDb);
+    await settle();
+    assert.deepEqual(h.started, ["a", "b", "c"]);
+
+    // lowered under what runs: the running calls finish, and a new one waits for a free slot
+    models.patchModel(model.name, { maxParallel: 1 }, queueDb);
+    const late = enqueueCall(model, queueDb, h.call("late"), "background");
+    h.release("a");
+    h.release("b");
+    await settle();
+    assert.deepEqual(h.started, ["a", "b", "c"], "one call still runs, and the limit is 1");
+    h.release("c");
+    await settle();
+    assert.deepEqual(h.started, ["a", "b", "c", "late"]);
+
+    // cleared: no limit, so every waiting call starts
+    const more = ["x", "y"].map((label) => enqueueCall(model, queueDb, h.call(label), "background"));
+    await settle();
+    assert.equal(waitingCalls(model.modelUid), 2);
+    models.patchModel(model.name, { maxParallel: null }, queueDb);
+    await settle();
+    assert.deepEqual(h.started, ["a", "b", "c", "late", "x", "y"]);
+    for (const label of ["late", "x", "y"]) h.release(label);
+    assert.deepEqual(await Promise.all([...calls, late, ...more]), ["a", "b", "c", "late", "x", "y"]);
+});
+
+test("a full limited queue refuses new background calls instead of pinning their payloads", async () => {
+    const model = queueModel(1);
+    const h = heldCalls();
+    const running = enqueueCall(model, queueDb, h.call("first"), "background");
+    await settle();
+
+    const flood = Array.from({ length: 500 }, () => enqueueCall(model, queueDb, async () => "queued", "background"));
     // the interactive lane keeps its own room: an agent's flood never refuses an owner turn
-    const interactive = enqueueCall(endpoint, async () => "interactive", "interactive");
-    release.resolve();
+    const interactive = enqueueCall(model, queueDb, async () => "interactive", "interactive");
+    h.release("first");
 
     const settled = await Promise.allSettled(flood);
     const refused = settled.filter((r) => r.status === "rejected");
-    assert.ok(refused.length > 0, "the queue is bounded");
-    assert.ok(settled.length - refused.length < 500, "the calls past the cap never queued");
+    assert.equal(refused.length, 500 - 64, "the queue holds 64 background calls");
     assert.ok(refused.every((r) => r.reason instanceof QueueFullError));
+    assert.match(String(refused[0]!.reason), new RegExp(`model "${model.name}" busy: 64 background calls already waiting`));
     assert.equal(await interactive, "interactive");
     assert.equal(await running, "first");
+});
+
+test("maxParallel is a whole number from 1 to 256, or null for no limit", () => {
+    const db = gatewayDb(dbPath("max-parallel"));
+    const base = { provider: "llamacpp", endpoint: "http://box:8000", contextTokens: 1000 };
+    for (const maxParallel of [0, -1, 1.5, 257, "2", true, [], {}]) {
+        assert.throws(
+            () => models.addModel({ ...base, name: "bad", maxParallel }, db),
+            /"maxParallel" must be a whole number from 1 to 256, or null for no limit/,
+            JSON.stringify(maxParallel),
+        );
+    }
+    models.addModel({ ...base, name: "open" }, db);
+    models.addModel({ ...base, name: "few", maxParallel: 2 }, db);
+    assert.deepEqual(models.describeModels(db).map((m) => [m.name, m.maxParallel]), [["open", null], ["few", 2]]);
+    models.patchModel("few", { maxParallel: 256 }, db);
+    assert.throws(() => models.patchModel("few", { maxParallel: 0 }, db), /"maxParallel" must be/);
+    assert.equal(models.getModel("few", db)?.maxParallel, 256, "a refused patch changes nothing");
+    models.patchModel("few", { contextTokens: 2000 }, db);
+    assert.equal(models.getModel("few", db)?.maxParallel, 256, "a patch that does not name it keeps it");
+    models.patchModel("few", { maxParallel: null }, db);
+    assert.equal(models.getModel("few", db)?.maxParallel, null);
 });
 
 // ── toWireMessages: images become OpenAI multipart content ─────────────────────────────────
@@ -616,7 +747,6 @@ test("endpoint spellings that name one server are stored as one string", () => {
     const base = { provider: "llamacpp", contextTokens: 1000 };
     models.addModel({ ...base, name: "plain", endpoint: "http://box:8000" }, db);
     models.addModel({ ...base, name: "slashed", endpoint: "HTTP://BOX:8000///" }, db);
-    // one string means one per-endpoint queue: the single-slot server never sees two calls
     assert.equal(models.getModel("plain", db)?.endpointUrl, "http://box:8000");
     assert.equal(models.getModel("slashed", db)?.endpointUrl, "http://box:8000");
 

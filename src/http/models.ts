@@ -74,7 +74,7 @@ export function registerModels(router: Router, db: GatewayDb): void {
             const next = rawName.trim();
             if (next !== name) renameTo = next;
         }
-        const patch: { endpoint?: string; modelId?: string; contextTokens?: number; vision?: boolean; params?: Record<string, unknown> } = {};
+        const patch: { endpoint?: string; modelId?: string; contextTokens?: number; vision?: boolean; params?: Record<string, unknown>; maxParallel?: unknown } = {};
         const endpoint = body["endpoint"];
         if (endpoint !== undefined) {
             if (typeof endpoint !== "string" || !endpoint.trim()) {
@@ -110,6 +110,8 @@ export function registerModels(router: Router, db: GatewayDb): void {
             }
             patch.vision = vision;
         }
+        // parseEntry validates it; null clears the limit
+        if (body["maxParallel"] !== undefined) patch.maxParallel = body["maxParallel"];
         const rawApiKey = body["apiKey"];
         if (rawApiKey !== undefined && typeof rawApiKey !== "string") {
             return json(ctx.res, 400, { error: '"apiKey" must be a string' });

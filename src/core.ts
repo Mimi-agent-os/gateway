@@ -559,7 +559,8 @@ export function createGatewayCore(opts: GatewayCoreOptions = {}): GatewayCore {
             const sent = visibleTo(cfg.vision, messages);
             try {
                 await enqueueCall(
-                    cfg.endpointUrl,
+                    cfg,
+                    db,
                     async () => {
                         // the gate binds at DEQUEUE too: what ran ahead of this call may have spent
                         // the model's limit while this one waited in the queue

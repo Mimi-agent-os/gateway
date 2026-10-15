@@ -17,6 +17,7 @@ interface LimitRow {
     priceInPerM: number;
     priceOutPerM: number;
     limit: { unit: "tokens" | "usd"; value: number } | null;
+    maxParallel: number | null;
     today: { tokens: number; promptTokens: number; completionTokens: number; cost: number };
     day: { today: string; timeZone: string; resetsAt: string };
 }
@@ -43,6 +44,7 @@ test("GET /api/limits lists every model with its prices, limit and today's spend
                 priceInPerM: 0,
                 priceOutPerM: 0,
                 limit: null,
+                maxParallel: null,
                 today: { tokens: 500, promptTokens: 400, completionTokens: 100, cost: 0 },
                 day: dayInfo(),
             },
@@ -53,6 +55,7 @@ test("GET /api/limits lists every model with its prices, limit and today's spend
                 priceInPerM: 0,
                 priceOutPerM: 0,
                 limit: null,
+                maxParallel: null,
                 today: { tokens: 0, promptTokens: 0, completionTokens: 0, cost: 0 },
                 day: dayInfo(),
             },

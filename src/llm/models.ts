@@ -4,6 +4,7 @@ import { hasSecret, secret, setEnv, unsetEnv } from "../store/env.ts";
 import type { Message, Tool } from "@mimi-os/protocol";
 
 import { BaseProvider, type ProviderStream } from "./base/index.ts";
+import { parallelLimitChanged } from "./queue.ts";
 import { splitThinkTags } from "./providers/shared/openai-sse.ts";
 import { LlamaProvider, LLAMA_PARAM_INFO, type LlamaParams } from "./providers/llama-cpp/index.ts";
 import { VllmProvider, VLLM_PARAM_INFO, type VllmParams } from "./providers/vllm/index.ts";
@@ -24,6 +25,8 @@ export interface ModelConfig extends ModelPricing {
     contextTokens: number;
     /** Model-level capability: the single multimodal model accepts images (data-URIs) alongside text. */
     vision: boolean;
+    /** At most this many calls of this model at once, counted per model, not per endpoint; null = no limit. */
+    maxParallel: number | null;
     isDefault: boolean;
 }
 
@@ -61,6 +64,7 @@ interface ModelInfo {
     modelId?: string | undefined;
     contextTokens: number;
     vision: boolean;
+    maxParallel: number | null;
     isDefault: boolean;
     params: Record<string, unknown>;
     keyEnv: string;
@@ -73,6 +77,8 @@ interface ModelPatch {
     contextTokens?: number;
     vision?: boolean | undefined;
     params?: Record<string, unknown>;
+    /** Raw JSON for parseEntry; null clears the limit. */
+    maxParallel?: unknown;
 }
 
 interface Adapter {
@@ -155,6 +161,7 @@ const DEFAULT_KEY = "default_model";
 export const MODEL_NAME_PATTERN = "[A-Za-z0-9][A-Za-z0-9_.:-]*";
 const MODEL_NAME = new RegExp(`^${MODEL_NAME_PATTERN}$`);
 const LOOPBACK = /^(?:localhost|127\.\d+\.\d+\.\d+|\[::1\])$/;
+const MAX_PARALLEL = 256;
 
 export function describeProviders(): ProviderInfo[] {
     return Object.entries(adapters).map(([kind, a]) => ({
@@ -208,6 +215,15 @@ function parseEntry(raw: unknown): ModelFields {
         throw new Error(`models: model "${name}" — "vision" must be a boolean.`);
     }
     const vision = visionRaw === true;
+    const maxParallel = m["maxParallel"] ?? null;
+    if (
+        maxParallel !== null &&
+        (typeof maxParallel !== "number" || !Number.isInteger(maxParallel) || maxParallel < 1 || maxParallel > MAX_PARALLEL)
+    ) {
+        throw new Error(
+            `models: model "${name}" — "maxParallel" must be a whole number from 1 to ${MAX_PARALLEL}, or null for no limit.`,
+        );
+    }
     const rawParams = m["params"];
     if (rawParams !== undefined && (typeof rawParams !== "object" || rawParams === null || Array.isArray(rawParams))) {
         throw new Error(`models: model "${name}" — "params" must be an object.`);
@@ -245,7 +261,7 @@ function parseEntry(raw: unknown): ModelFields {
                 `its API key in cleartext.`,
         );
     }
-    // one spelling per server: the stored value, the request URL and the queue key are this string;
+    // one spelling per server: the stored value and the request URL are this string;
     // every adapter appends /v1/chat/completions, so a pasted ".../v1" base loses its /v1
     const endpoint = url.origin + url.pathname.replace(/\/+$/, "").replace(/\/v1$/, "");
     const modelId = m["modelId"];
@@ -265,6 +281,7 @@ function parseEntry(raw: unknown): ModelFields {
         modelId: modelId as string | undefined,
         contextTokens: ctx,
         vision,
+        maxParallel,
         params,
     };
 }
@@ -285,6 +302,7 @@ function rowToConfig(row: ModelRow, def: string | null): ModelConfig {
         params: row.params,
         contextTokens: row.contextTokens,
         vision: row.vision,
+        maxParallel: row.maxParallel,
         isDefault: row.name === def,
         priceInPerM: row.priceInPerM,
         priceOutPerM: row.priceOutPerM,
@@ -324,6 +342,7 @@ export function describeModels(db: GatewayDb = gatewayDb()): ModelInfo[] {
             modelId: m.modelId,
             contextTokens: m.contextTokens,
             vision: m.vision,
+            maxParallel: m.maxParallel,
             isDefault: m.isDefault,
             params: m.params,
             keyEnv,
@@ -381,6 +400,7 @@ export function addModel(entry: Record<string, unknown>, db: GatewayDb = gateway
         contextTokens: parsed.contextTokens,
         vision: parsed.vision,
         params: parsed.params,
+        maxParallel: parsed.maxParallel,
     });
     return parsed;
 }
@@ -441,7 +461,8 @@ export function patchModel(
         patch.modelId !== undefined ||
         patch.contextTokens !== undefined ||
         patch.vision !== undefined ||
-        patch.params !== undefined;
+        patch.params !== undefined ||
+        patch.maxParallel !== undefined;
     const parsed = changesFields
         ? parseEntry({
               name: row.name,
@@ -451,6 +472,7 @@ export function patchModel(
               contextTokens: patch.contextTokens ?? row.contextTokens,
               vision: patch.vision ?? row.vision,
               params: patch.params ?? row.params,
+              maxParallel: patch.maxParallel === undefined ? row.maxParallel : patch.maxParallel,
           })
         : null;
 
@@ -488,7 +510,9 @@ export function patchModel(
             contextTokens: parsed.contextTokens,
             vision: parsed.vision,
             params: parsed.params,
+            maxParallel: parsed.maxParallel,
         });
+        if (patch.maxParallel !== undefined) parallelLimitChanged(row.modelUid);
     }
     return to === from ? null : { from, to };
 }

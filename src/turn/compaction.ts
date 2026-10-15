@@ -99,7 +99,8 @@ async function complete(call: SummaryCall, request: Message[], db: GatewayDb): P
         const provider = createProvider(cfg.name, db);
         model = provider.model ?? null;
         await enqueueCall(
-            cfg.endpointUrl,
+            cfg,
+            db,
             () => {
                 // the same gate as every other call of this agent, at dequeue: pause, grant, daily limit
                 admitAtDequeue(agent, cfg, db);
